@@ -317,16 +317,6 @@ describe('reconcileResumeMessages', () => {
     const [out] = reconcileResumeMessages(next, previous)
     expect(out.parts.some(p => p.type === 'reasoning')).toBe(true)
   })
-
-  it('keeps local attachment previews when the stored image turn replaces its optimistic row', () => {
-    const caption = 'Switched away and back'
-    const next = [msg('stored-user', 'user', `${caption}\n\n[Image attached at: C:\\shots\\one.png]\n[screenshot]`)]
-    const previous = [msg('user-optimistic', 'user', caption, { attachmentRefs: ['@image:C:\\shots\\one.png'] })]
-
-    const [out] = reconcileResumeMessages(next, previous)
-
-    expect(out.attachmentRefs).toEqual(['@image:C:\\shots\\one.png'])
-  })
 })
 
 describe('preserveLocalPendingTurnMessages', () => {
@@ -365,47 +355,6 @@ describe('preserveLocalPendingTurnMessages', () => {
     expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
   })
 
-<<<<<<< HEAD
-  it('drops local optimistic user messages when server text includes image attachment notices', () => {
-    const previous = [
-      msg('1-user', 'user', 'First, the voice SUCKS.'),
-      msg('2-assistant', 'assistant', 'HOW TO USE THEM'),
-      msg('user-optimistic-1', 'user', 'Nothing happens.'),
-      msg('user-optimistic-2', 'user', 'Nothing happens when I click Create')
-    ]
-
-    const next = [
-      msg('1-user-stored', 'user', 'First, the voice SUCKS.\n[Image attached at: C:\\path\\shot.png]'),
-      msg('2-assistant-stored', 'assistant', 'HOW TO USE THEM'),
-      msg('3-user-stored', 'user', 'Nothing happens.\n[Image attached at: C:\\path\\shot2.png]'),
-      msg('4-user-stored', 'user', 'Nothing happens when I click Create')
-    ]
-
-    expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
-  })
-
-  it('drops the optimistic copy when persisted image turns include screenshot placeholders', () => {
-    const caption = 'Switched away and back'
-    const previous = [msg('user-optimistic', 'user', caption)]
-
-    const next = [
-      msg(
-        'user-stored',
-        'user',
-        `${caption}\n\n[Image attached at: C:\\shots\\one.png]\n[Image attached at: C:\\shots\\two.png]\n[screenshot]\n[screenshot]`
-      )
-    ]
-
-    expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
-  })
-
-  it('drops local optimistic user messages if content matches anywhere in nextMessages even if ordinals shifted', () => {
-    const previous = [msg('user-optimistic-1', 'user', 'First, the voice SUCKS.')]
-
-    const next = [
-      msg('0-sys', 'system', 'System prompt'),
-      msg('1-user-stored', 'user', 'First, the voice SUCKS.\n[Image attached at: C:\\path\\shot.png]')
-=======
   it('drops stale optimistic history after compression and keeps only the live tail', () => {
     const compressedAuthority = [
       msg('stored-user', 'user', 'first turn that survived compression'),
@@ -464,13 +413,10 @@ describe('preserveLocalPendingTurnMessages', () => {
       msg('s4-user', 'user', 'second question'),
       msg('s5-assistant', 'assistant', 'second answer'),
       msg('s6-marker', 'user', marker('k3'))
->>>>>>> origin/main
     ]
 
     expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
   })
-<<<<<<< HEAD
-=======
 
   it('still keeps a genuinely uncommitted optimistic turn when a marker is present', () => {
     const previous = [
@@ -494,7 +440,6 @@ describe('preserveLocalPendingTurnMessages', () => {
       'user-optimistic'
     ])
   })
->>>>>>> origin/main
 })
 
 describe('appendLiveSessionProjection', () => {
@@ -522,69 +467,15 @@ describe('appendLiveSessionProjection', () => {
     expect(restored[3]).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
   })
 
-<<<<<<< HEAD
-  it('does not append a second user row when live history already persisted the in-flight image turn', () => {
-    const caption = 'Switched away and back'
-
-    const stored = [
-      msg('stored-user', 'user', 'earlier'),
-      msg('stored-assistant', 'assistant', 'earlier answer'),
-      msg(
-        'stored-current-user',
-        'user',
-        `${caption}\n\n[Image attached at: C:\\shots\\one.png]\n[Image attached at: C:\\shots\\two.png]\n[screenshot]\n[screenshot]`
-      )
-=======
   it('does not duplicate a persisted inflight user after consecutive canceled user turns', () => {
     const stored = [
       msg('stored-user-1', 'user', 'canceled prompt one'),
       msg('stored-user-2', 'user', 'canceled prompt two'),
       msg('stored-user-3', 'user', 'current running prompt')
->>>>>>> origin/main
     ]
 
     const restored = appendLiveSessionProjection(stored, {
       session_id: 'runtime-1',
-<<<<<<< HEAD
-      inflight: { user: caption, assistant: '', streaming: true }
-    })
-
-    expect(restored.filter(message => message.role === 'user').map(message => message.id)).toEqual([
-      'stored-user',
-      'stored-current-user'
-    ])
-    expect(restored.at(-1)).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
-  })
-
-  it('recognizes a persisted in-flight turn whose partial assistant tail is also projected', () => {
-    const stored = [
-      msg('stored-current-user', 'user', 'current prompt'),
-      msg('stored-current-assistant', 'assistant', 'partial answer')
-    ]
-
-    const restored = appendLiveSessionProjection(stored, {
-      session_id: 'runtime-1',
-      inflight: { user: 'current prompt', assistant: 'partial answer continuing', streaming: true }
-    })
-
-    expect(restored.filter(message => message.role === 'user').map(message => message.id)).toEqual([
-      'stored-current-user'
-    ])
-  })
-
-  it('keeps a new repeated prompt when the matching stored turn is already complete', () => {
-    const stored = [msg('older-user', 'user', 'repeat this'), msg('older-assistant', 'assistant', 'old answer')]
-
-    const restored = appendLiveSessionProjection(stored, {
-      session_id: 'runtime-1',
-      inflight: { user: 'repeat this', assistant: '', streaming: true }
-    })
-
-    expect(restored.filter(message => message.role === 'user').map(message => message.id)).toEqual([
-      'older-user',
-      'user-inflight-runtime-1'
-    ])
-=======
       inflight: {
         user: 'current running prompt',
         assistant: 'partial answer',
@@ -600,7 +491,6 @@ describe('appendLiveSessionProjection', () => {
       'partial answer'
     ])
     expect(restored[3]).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
->>>>>>> origin/main
   })
 
   it('preserves the original array when no live projection exists', () => {

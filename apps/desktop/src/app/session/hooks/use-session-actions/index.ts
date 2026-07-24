@@ -497,7 +497,7 @@ export function useSessionActions({
         // unlisted (draft) tab stays out of the session list until its first
         // turn persists and a refresh surfaces it.
         if (listed) {
-        upsertOptimisticSession(created, stored, null, null)
+          upsertOptimisticSession(created, stored, null, null)
         }
 
         const runtimeInfo = applyRuntimeInfo(created.info)
@@ -508,7 +508,7 @@ export function useSessionActions({
         revealTreePane(`session-tile:${stored}`)
 
         if (listed) {
-        broadcastSessionsChanged()
+          broadcastSessionsChanged()
         }
       } catch (error) {
         notifyError(error, copy.createSessionFailed)
@@ -826,7 +826,7 @@ export function useSessionActions({
 
         let localSnapshot = resumedSameSelectedSession
           ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
-          : []
+          : $messages.get()
 
         let prefetchApplied = false
         let prefetchedStoredSessionId: string | null = null
@@ -862,26 +862,7 @@ export function useSessionActions({
 
         try {
           if (prefetchPromise) {
-<<<<<<< HEAD
-            const storedMessages = await prefetchPromise
-
-            if (isCurrentResume()) {
-              const previousMessages = resumedSameSelectedSession
-                ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
-                : []
-
-              localSnapshot = reconcileAuthoritativeMessages(storedMessages.messages, previousMessages)
-              prefetchApplied = true
-              prefetchedMessageCount = storedMessages.messages.length
-              prefetchedStoredSessionId = storedMessages.session_id || storedSessionId
-
-              if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
-                setMessages(localSnapshot)
-              }
-            }
-=======
             prefetchedResult = await prefetchPromise
->>>>>>> origin/main
           }
         } catch {
           // Non-fatal: gateway resume below can still hydrate the session.
@@ -923,7 +904,7 @@ export function useSessionActions({
             : (() => {
                 const previousMessages = resumedSameSelectedSession
                   ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
-                  : []
+                  : currentMessages
 
                 const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
 
@@ -936,7 +917,7 @@ export function useSessionActions({
         const messagesForView =
           preferredMessages === currentMessages
             ? currentMessages
-            : preserveLocalAssistantErrors(preferredMessages, resumedSameSelectedSession ? currentMessages : [])
+            : preserveLocalAssistantErrors(preferredMessages, currentMessages)
 
         if (sessionShouldHaveTranscript(stored) && messagesForView.length === 0) {
           setActiveSessionId(null)
@@ -998,7 +979,7 @@ export function useSessionActions({
 
           const previousMessages = resumedSameSelectedSession
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
-            : []
+            : $messages.get()
 
           setMessages(reconcileAuthoritativeMessages(fallback.messages, previousMessages))
         } catch (e) {

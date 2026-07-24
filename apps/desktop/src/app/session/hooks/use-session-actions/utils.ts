@@ -1,11 +1,5 @@
 import { getSession } from '@/hermes'
-import {
-  assistantTextPart,
-  type ChatMessage,
-  chatMessageText,
-  comparableUserMessageText,
-  textPart
-} from '@/lib/chat-messages'
+import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -184,27 +178,6 @@ export function chatMessageArraysEquivalent(a: ChatMessage[], b: ChatMessage[]):
   return a.length === b.length && a.every((message, index) => chatMessagesEquivalent(message, b[index]))
 }
 
-export function stripAttachmentNotices(text: string): string {
-  return comparableUserMessageText(text)
-}
-
-export function userTextMatches(textA: string, textB: string): boolean {
-  const cleanA = stripAttachmentNotices(textA)
-  const cleanB = stripAttachmentNotices(textB)
-
-  if (cleanA === cleanB) {
-    return true
-  }
-
-  if (cleanA && cleanB) {
-    if (cleanA.startsWith(cleanB) || cleanB.startsWith(cleanA)) {
-      return true
-    }
-  }
-
-  return false
-}
-
 export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMessages: ChatMessage[]): ChatMessage[] {
   if (!previousMessages.length) {
     return nextMessages
@@ -236,20 +209,8 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
     const previousVisibleText = textWithoutEmbeddedImages(previousText)
     let preserved = message
 
-    const matchingText =
-      nextText === previousVisibleText || nextText === previousText.trim() || userTextMatches(nextText, previousText)
-
-    if (matchingText) {
+    if (nextText === previousVisibleText || nextText === previousText.trim()) {
       preserved = preserveReasoningParts(preserved, previous)
-    }
-
-    const matchingUserTurn =
-      message.role === 'user' &&
-      previous.role === 'user' &&
-      comparableUserMessageText(nextText) === comparableUserMessageText(previousText)
-
-    if (matchingUserTurn && previous.attachmentRefs?.length && !preserved.attachmentRefs?.length) {
-      preserved = { ...preserved, attachmentRefs: previous.attachmentRefs }
     }
 
     const previousImages = embeddedImageUrls(previousText)
@@ -300,7 +261,6 @@ export function preserveLocalPendingTurnMessages(
 
   const nextByRoleOrdinal = new Map<string, ChatMessage>()
   const nextRoleCounts = new Map<ChatMessage['role'], number>()
-  const nextUserMessages: ChatMessage[] = []
 
   for (const message of nextMessages) {
     if (isGatewaySystemMarker(message)) {
@@ -310,10 +270,6 @@ export function preserveLocalPendingTurnMessages(
     const ordinal = nextRoleCounts.get(message.role) ?? 0
     nextRoleCounts.set(message.role, ordinal + 1)
     nextByRoleOrdinal.set(`${message.role}:${ordinal}`, message)
-
-    if (message.role === 'user') {
-      nextUserMessages.push(message)
-    }
   }
 
   const nextIds = new Set(nextMessages.map(message => message.id))
@@ -343,10 +299,6 @@ export function preserveLocalPendingTurnMessages(
       continue
     }
 
-<<<<<<< HEAD
-    if (isPendingAssistant) {
-      const authoritative = nextByRoleOrdinal.get(`assistant:${ordinal}`)
-=======
     if (isOptimisticUser && message !== newestOptimisticUser) {
       continue
     }
@@ -360,22 +312,13 @@ export function preserveLocalPendingTurnMessages(
     }
 
     const authoritative = nextByRoleOrdinal.get(`${message.role}:${ordinal}`)
->>>>>>> origin/main
 
-      if (authoritative) {
-        continue
-      }
-    }
-
-    if (isOptimisticUser) {
-      const localText = chatMessageText(message)
-      const authoritative = nextByRoleOrdinal.get(`user:${ordinal}`)
-
-      if (authoritative && userTextMatches(chatMessageText(authoritative), localText)) {
+    if (authoritative) {
+      if (isPendingAssistant) {
         continue
       }
 
-      if (nextUserMessages.some(nextMsg => userTextMatches(chatMessageText(nextMsg), localText))) {
+      if (chatMessageText(authoritative).trim() === chatMessageText(message).trim()) {
         continue
       }
     }
@@ -387,12 +330,13 @@ export function preserveLocalPendingTurnMessages(
 }
 
 /**
- * Append the missing backend-only tail of a live turn to a stored transcript.
+ * Append the backend-only tail of a live turn to a stored transcript.
  *
- * The live DB display can already contain the current user and tool rows because
- * the agent persists incrementally. Avoid projecting that user twice, while
- * retaining `inflight` for an unpersisted turn/stream and `queued` for the
- * accepted next-turn prompt that exists only in gateway memory.
+ * Session history is committed only when a turn finishes. During a reconnect,
+ * `inflight` is therefore the authority for the currently running user/assistant
+ * pair, while `queued` is an accepted next-turn prompt waiting in gateway
+ * memory. Stable ids let repeated activate/resume hydration reconcile instead
+ * of growing duplicate rows.
  */
 export function appendLiveSessionProjection(
   messages: ChatMessage[],
@@ -409,40 +353,6 @@ export function appendLiveSessionProjection(
 
   const sessionId = projection.session_id || 'session'
   const projected: ChatMessage[] = []
-<<<<<<< HEAD
-  const lastAuthoritativeUserIndex = messages.findLastIndex(message => message.role === 'user' && !message.hidden)
-  const lastAuthoritativeUser = messages[lastAuthoritativeUserIndex]
-  const normalizeAssistant = (value: string) => value.replace(/\s+/g, ' ').trim()
-
-  // Equal user text can be an older completed turn. If that turn has visible
-  // assistant output, treat it as live only when the in-flight snapshot carries
-  // the same prefix; an empty/tool-only tail is safe because it has no settled
-  // answer that could prove the turn already completed.
-  const authoritativeAssistantTail = normalizeAssistant(
-    messages
-      .slice(lastAuthoritativeUserIndex + 1)
-      .filter(message => message.role === 'assistant' && !message.hidden)
-      .map(chatMessageText)
-      .join('')
-  )
-
-  const projectedAssistant = normalizeAssistant(inflightAssistant)
-
-  const assistantTailCanBelongToInflight =
-    !authoritativeAssistantTail ||
-    (projectedAssistant &&
-      (projectedAssistant.startsWith(authoritativeAssistantTail) ||
-        authoritativeAssistantTail.startsWith(projectedAssistant)))
-
-  const inflightUserAlreadyStored = Boolean(
-    inflightUser &&
-    lastAuthoritativeUser &&
-    comparableUserMessageText(chatMessageText(lastAuthoritativeUser)) === comparableUserMessageText(inflightUser) &&
-    assistantTailCanBelongToInflight
-  )
-
-  if (inflightUser && !inflightUserAlreadyStored) {
-=======
   // A turn normally persists its user row before inference begins. session.resume
   // then returns that stored row *and* the still-live inflight projection; adding
   // both makes a backgrounded prompt appear twice when its session is reopened.
@@ -452,7 +362,6 @@ export function appendLiveSessionProjection(
   const inflightUserAlreadyPersisted = latestUser && chatMessageText(latestUser).trim() === inflightUser
 
   if (inflightUser && !inflightUserAlreadyPersisted) {
->>>>>>> origin/main
     projected.push({
       id: `user-inflight-${sessionId}`,
       role: 'user',

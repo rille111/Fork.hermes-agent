@@ -52,11 +52,12 @@ def test_build_native_request_preserves_thought_signature_on_tool_replay():
     assert parts[0]["thoughtSignature"] == "sig-123"
 
 
-def test_build_native_request_adds_dummy_signature_for_cross_provider_tool_replay():
-    """Gemini 3 requires a signature on every model-side functionCall part.
-
-    Calls replayed after switching from another provider cannot carry a real
-    Gemini signature, so Google documents this sentinel for that exact case.
+def test_build_native_request_emits_sentinel_for_cross_provider_tool_call():
+    """Cross-provider tool_calls (xAI/Anthropic -> Gemini fallback) carry no
+    Gemini thoughtSignature.  Without a sentinel, Gemini 3 thinking models
+    reject the request with 400 INVALID_ARGUMENT.  The native adapter must
+    emit the same ``skip_thought_signature_validator`` sentinel that the
+    Cloud Code Assist adapter already uses for the same scenario.
     """
     from agent.gemini_native_adapter import build_gemini_request
 
@@ -67,12 +68,14 @@ def test_build_native_request_adds_dummy_signature_for_cross_provider_tool_repla
                 "content": "",
                 "tool_calls": [
                     {
-                        "id": "call_from_another_provider",
+                        "id": "call_1",
                         "type": "function",
                         "function": {
-                            "name": "skill_view",
-                            "arguments": '{"name": "hermes-agent"}',
+                            "name": "get_weather",
+                            "arguments": '{"city": "Paris"}',
                         },
+                        # No extra_content — this tool_call originated from a
+                        # non-Gemini provider during fallback.
                     }
                 ],
             },
@@ -81,9 +84,9 @@ def test_build_native_request_adds_dummy_signature_for_cross_provider_tool_repla
         tool_choice=None,
     )
 
-    part = request["contents"][0]["parts"][0]
-    assert part["functionCall"]["name"] == "skill_view"
-    assert part["thoughtSignature"] == "skip_thought_signature_validator"
+    parts = request["contents"][0]["parts"]
+    assert parts[0]["functionCall"]["name"] == "get_weather"
+    assert parts[0]["thoughtSignature"] == "skip_thought_signature_validator"
 
 
 def test_followup_user_turn_is_not_merged_into_function_response_turn():
