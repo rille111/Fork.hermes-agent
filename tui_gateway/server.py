@@ -3725,17 +3725,17 @@ def _compress_session_history(
     # compaction bypasses the summary-failure cooldown, matching the CLI
     # and gateway handlers.
     try:
-    compressed, _ = agent._compress_context(
+        compressed, _ = agent._compress_context(
             head,
-        None,
-        approx_tokens=approx_tokens,
+            None,
+            approx_tokens=approx_tokens,
             # Partial compress has no focus topic (the modes are exclusive;
             # parse_partial_compress_args returns focus_topic=None for the
             # boundary-aware forms).
-        focus_topic=focus_topic or None,
+            focus_topic=focus_topic or None,
             force=True,
             defer_context_engine_notification=True,
-    )
+        )
     except Exception:
         finalize_context_engine_compression_notification(
             agent,
@@ -15591,7 +15591,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             # parses the boundary-aware forms (here [N], up to here, --keep N)
             # and does the partial head/tail split there (#35533).
             try:
-            _compress_session_history(session, arg)
+                _compress_session_history(session, arg)
             except CompressionLockHeld as e:
                 from agent.manual_compression_feedback import (
                     describe_compression_lock_skip,
