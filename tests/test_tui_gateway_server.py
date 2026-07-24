@@ -3570,9 +3570,7 @@ class _RecordingAgent:
     def clear_interrupt(self):
         return None
 
-    def run_conversation(
-        self, prompt, conversation_history=None, stream_callback=None
-    ):
+    def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
         self._turns.append(prompt)
         return {"final_response": "", "messages": []}
 
@@ -3681,9 +3679,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         return thread
 
     class _BlockingNotificationAgent(_RecordingAgent):
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
             if "proc_batch_1" in prompt:
                 nested_started.set()
@@ -6439,9 +6435,7 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     captured = {}
 
     class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             captured["session_key"] = get_current_session_key(default="")
             return {
                 "final_response": "ok",
@@ -6481,9 +6475,7 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
         base_url = ""
         api_key = ""
 
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             captured["prompt"] = prompt
             return {
                 "final_response": "ok",
@@ -7352,9 +7344,7 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
     session_ref = {"s": None}
 
     class _RacyAgent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             # Simulate: something external bumped history_version
             # while we were running.
             with session_ref["s"]["history_lock"]:
@@ -7415,9 +7405,7 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
     captured: dict[str, str] = {}
 
     class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             captured["prompt"] = prompt
             return {
                 "final_response": "ok",
@@ -7459,9 +7447,7 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
     """Regression guard: the backstop does not affect the happy path."""
 
     class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
                 "final_response": "reply",
                 "messages": [{"role": "assistant", "content": "reply"}],
@@ -7512,9 +7498,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
     seen = {}
 
     class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             seen["prompt"] = prompt
             seen["history"] = conversation_history
             return {
@@ -8964,9 +8948,7 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
         api_key = object()
         api_mode = "codex_responses"
 
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
                 "final_response": "Rome was founded in 753 BC.",
                 "messages": [
@@ -9009,9 +8991,7 @@ def test_prompt_submit_skips_auto_title_when_interrupted(monkeypatch):
     """maybe_auto_title must NOT be called when the agent was interrupted."""
 
     class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
                 "final_response": "partial answer",
                 "interrupted": True,
@@ -9041,9 +9021,7 @@ def test_prompt_submit_skips_auto_title_when_response_empty(monkeypatch):
     """maybe_auto_title must NOT be called when the agent returns an empty reply."""
 
     class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
                 "final_response": "",
                 "messages": [],
@@ -9074,9 +9052,7 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     instead of emitting a blank message.complete turn."""
 
     class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
                 "final_response": None,
                 "messages": [],
@@ -9121,9 +9097,7 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     semantics owned by downstream handlers."""
 
     class _Agent:
-        def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
-        ):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             return {
                 "final_response": None,
                 "messages": [],
@@ -9286,7 +9260,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     class _Agent:
         model = "model-live"
 
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             assert prompt == "write a long answer"
             assert conversation_history == []
             stream_callback("partial ")
@@ -10610,7 +10584,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
     emitted = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
             return {
                 "final_response": "ok",
@@ -10681,7 +10655,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
     turns = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
             return {"final_response": "ok", "messages": []}
 
