@@ -1,4 +1,4 @@
-"""Tests for terminal process timeout, interactive prompt detection, GUI app detection, CPU idle detection, and non-interactive env injection."""
+"""Tests for explicit terminal inactivity policy and safe environment defaults."""
 
 import os
 import time
@@ -8,8 +8,6 @@ from unittest.mock import MagicMock, patch
 from tools.environments.base import (
     _strip_ansi,
     _detect_interactive_prompt,
-    _detect_gui_child_process,
-    _inspect_process_tree_activity,
     _NONINTERACTIVE_ENV_DEFAULTS,
     _BoundedOutputCollector,
     BaseEnvironment,
@@ -44,16 +42,20 @@ def test_detect_interactive_prompt():
 
 
 def test_noninteractive_env_defaults():
-    # Check that defaults dictionary contains essential non-interactive keys
-    assert _NONINTERACTIVE_ENV_DEFAULTS["CI"] == "1"
+    # Keep narrow prompt prevention without changing build/test semantics.
     assert _NONINTERACTIVE_ENV_DEFAULTS["DEBIAN_FRONTEND"] == "noninteractive"
     assert _NONINTERACTIVE_ENV_DEFAULTS["GIT_TERMINAL_PROMPT"] == "0"
     assert _NONINTERACTIVE_ENV_DEFAULTS["PIP_NO_INPUT"] == "1"
     assert _NONINTERACTIVE_ENV_DEFAULTS["PYTHONUNBUFFERED"] == "1"
+    assert "CI" not in _NONINTERACTIVE_ENV_DEFAULTS
+    assert "AUTOMATED_TESTING" not in _NONINTERACTIVE_ENV_DEFAULTS
+    assert "NPM_CONFIG_YES" not in _NONINTERACTIVE_ENV_DEFAULTS
 
     # Verify _make_run_env includes them
     run_env = _make_run_env({})
-    assert run_env.get("CI") == "1"
+    assert "CI" not in run_env
+    assert "AUTOMATED_TESTING" not in run_env
+    assert "NPM_CONFIG_YES" not in run_env
     assert run_env.get("GIT_TERMINAL_PROMPT") == "0"
     assert run_env.get("PIP_NO_INPUT") == "1"
 
@@ -80,11 +82,13 @@ class DummyEnvironment(BaseEnvironment):
 def test_environment_env_injection():
     env = DummyEnvironment(cwd=".", timeout=60, env={"CUSTOM_VAR": "value"})
     assert env.env["CUSTOM_VAR"] == "value"
-    assert env.env["CI"] == "1"
+    assert "CI" not in env.env
+    assert "AUTOMATED_TESTING" not in env.env
+    assert "NPM_CONFIG_YES" not in env.env
     assert env.env["GIT_TERMINAL_PROMPT"] == "0"
 
 
-def test_wait_for_process_prompt_detection():
+def test_wait_for_process_prompt_detection_when_policy_enabled():
     env = DummyEnvironment(cwd=".", timeout=60)
     
     # Mock ProcessHandle
@@ -114,61 +118,35 @@ def test_wait_for_process_inactivity_timeout():
     proc.pid = 12345
     proc.stdout = None
 
-    with patch("tools.environments.base._BoundedOutputCollector") as MockCollector, \
-         patch("tools.environments.base._inspect_process_tree_activity") as mock_inspect:
+    with patch("tools.environments.base._BoundedOutputCollector") as MockCollector:
         mock_collector_inst = MagicMock()
         MockCollector.return_value = mock_collector_inst
         mock_collector_inst.get_tail.return_value = "Building project..."
         mock_collector_inst.last_update_time = time.monotonic() - 15.0  # 15s idle
         mock_collector_inst.render.side_effect = lambda suffix="": "Building project..." + suffix
-        # Active CPU usage (50.0%) so inactivity timeout triggers instead of 10s idle check
-        mock_inspect.return_value = {"alive": True, "total_cpu": 50.0, "gui_app": None, "child_count": 1}
-
         res = env._wait_for_process(proc, timeout=60, inactivity_timeout=10)
         assert res["returncode"] == 124
         assert "output inactivity" in res["output"]
 
 
-def test_wait_for_process_gui_detection():
+def test_zero_inactivity_timeout_does_not_kill_silent_process():
     env = DummyEnvironment(cwd=".", timeout=60)
-    
     proc = MagicMock()
-    proc.poll.return_value = None
+    proc.poll.side_effect = [None, 0, 0]
     proc.pid = 12345
     proc.stdout = None
+    proc.returncode = 0
+    env._kill_process = MagicMock()
 
-    with patch("tools.environments.base._BoundedOutputCollector") as MockCollector, \
-         patch("tools.environments.base._detect_gui_child_process") as mock_detect_gui:
-        mock_collector_inst = MagicMock()
-        MockCollector.return_value = mock_collector_inst
-        mock_collector_inst.get_tail.return_value = "Extracted zip..."
-        mock_collector_inst.last_update_time = time.monotonic() - 4.0
-        mock_collector_inst.render.side_effect = lambda suffix="": "Extracted zip..." + suffix
-        mock_detect_gui.return_value = "SoundVolumeView.exe"
+    with patch("tools.environments.base._BoundedOutputCollector") as MockCollector:
+        output = MagicMock()
+        MockCollector.return_value = output
+        output.get_tail.return_value = "Waiting on input..."
+        output.last_update_time = time.monotonic() - 30.0
+        output.total_chars = 0
+        output.render.return_value = "Waiting on input..."
 
-        res = env._wait_for_process(proc, timeout=60, inactivity_timeout=60)
-        assert res["returncode"] == 0
-        assert "Detected desktop GUI application 'SoundVolumeView.exe'" in res["output"]
+        res = env._wait_for_process(proc, timeout=60, inactivity_timeout=0)
 
-
-def test_wait_for_process_cpu_idle_detection():
-    env = DummyEnvironment(cwd=".", timeout=60)
-
-    proc = MagicMock()
-    proc.poll.return_value = None
-    proc.pid = 12345
-    proc.stdout = None
-
-    with patch("tools.environments.base._BoundedOutputCollector") as MockCollector, \
-         patch("tools.environments.base._inspect_process_tree_activity") as mock_inspect:
-        mock_collector_inst = MagicMock()
-        MockCollector.return_value = mock_collector_inst
-        mock_collector_inst.get_tail.return_value = "Waiting on input..."
-        mock_collector_inst.last_update_time = time.monotonic() - 11.0  # 11s idle
-        mock_collector_inst.render.side_effect = lambda suffix="": "Waiting on input..." + suffix
-        # 0.0% CPU usage (sleeping/idle process)
-        mock_inspect.return_value = {"alive": True, "total_cpu": 0.0, "gui_app": None, "child_count": 0}
-
-        res = env._wait_for_process(proc, timeout=60, inactivity_timeout=60)
-        assert res["returncode"] == 124
-        assert "completely idle (0% CPU" in res["output"]
+    assert res["returncode"] == 0
+    env._kill_process.assert_not_called()

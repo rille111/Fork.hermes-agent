@@ -193,84 +193,13 @@ def _detect_interactive_prompt(text: str) -> str | None:
     return None
 
 
-_KNOWN_GUI_EXES = {
-    "soundvolumeview.exe", "notepad.exe", "calc.exe", "explorer.exe",
-    "mspaint.exe", "devenv.exe", "wireshark.exe", "vlc.exe",
-    "chrome.exe", "msedge.exe", "firefox.exe", "control.exe",
-    "mmc.exe", "taskmgr.exe", "snippingtool.exe", "wordpad.exe",
-    "soundvolumeview", "notepad", "calc", "explorer", "devenv",
-}
-
-_KNOWN_CLI_EXES = {
-    "cmd.exe", "powershell.exe", "pwsh.exe", "bash.exe", "git.exe",
-    "node.exe", "python.exe", "python3.exe", "pip.exe", "conhost.exe",
-    "openconsole.exe", "wsl.exe", "ssh.exe", "curl.exe", "tar.exe",
-    "cargo.exe", "go.exe", "rustc.exe", "gcc.exe", "g++.exe", "cl.exe",
-    "make.exe", "cmake.exe", "ninja.exe", "git-bash.exe", "sh.exe",
-    "awk.exe", "sed.exe", "grep.exe", "find.exe", "sort.exe", "jq.exe",
-    "npm.exe", "npx.exe", "uv.exe", "deno.exe", "bun.exe"
-}
-
-
-def _detect_gui_child_process(pid: int) -> str | None:
-    if not pid:
-        return None
-    try:
-        import psutil
-        proc = psutil.Process(pid)
-        children = proc.children(recursive=True)
-        for child in children:
-            try:
-                name = child.name().lower()
-                if name in _KNOWN_GUI_EXES:
-                    return child.name()
-                if os.name == "nt" and name.endswith(".exe") and name not in _KNOWN_CLI_EXES:
-                    return child.name()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-    except Exception:
-        pass
-    return None
-
-
-def _inspect_process_tree_activity(pid: int) -> dict:
-    """Inspect CPU usage, child processes, and GUI apps across process tree."""
-    if not pid:
-        return {"alive": False, "total_cpu": 0.0, "gui_app": None, "child_count": 0}
-    try:
-        import psutil
-        parent = psutil.Process(pid)
-        procs = [parent] + parent.children(recursive=True)
-        total_cpu = 0.0
-        gui_app = None
-        for p in procs:
-            try:
-                total_cpu += p.cpu_percent(interval=None)
-                name = p.name().lower()
-                if name in _KNOWN_GUI_EXES or (os.name == "nt" and name.endswith(".exe") and name not in _KNOWN_CLI_EXES):
-                    gui_app = p.name()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return {
-            "alive": True,
-            "total_cpu": total_cpu,
-            "gui_app": gui_app,
-            "child_count": len(procs) - 1,
-        }
-    except Exception:
-        return {"alive": False, "total_cpu": 0.0, "gui_app": None, "child_count": 0}
-
-
 _NONINTERACTIVE_ENV_DEFAULTS = {
-    "CI": "1",
     "DEBIAN_FRONTEND": "noninteractive",
     "GIT_TERMINAL_PROMPT": "0",
     "PIP_NO_INPUT": "1",
     "PYTHONUNBUFFERED": "1",
     "PAGER": "cat",
     "GIT_PAGER": "cat",
-    "NPM_CONFIG_YES": "true",
-    "AUTOMATED_TESTING": "1",
     "TERRAFORM_INPUT": "0",
 }
 
@@ -379,7 +308,7 @@ def _popen_bash(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         **kwargs,
     )
     if stdin_data is not None:
@@ -513,6 +442,53 @@ def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
 
 
+# Per-session variables that the gateway bridges freshly onto every command's
+# process environment (via tools/environments/local._inject_session_context_env,
+# reading gateway.session_context._VAR_MAP). They must NEVER be persisted into
+# the shared bash session snapshot: a single long-lived backend serves many
+# concurrent sessions (the messaging gateway, TUI, desktop/web dashboard all
+# collapse the terminal to one "default" environment), so ``export -p`` dumping
+# the FIRST session's HERMES_SESSION_ID into the snapshot makes every LATER
+# session ``source`` that stale value and see a FOREIGN session's identity —
+# overriding the correct per-command Popen env (issue: cross-session
+# HERMES_SESSION_ID leak via the shared snapshot). Stripping them from the
+# snapshot is safe because they are re-injected on every command; a snapshot
+# should only carry the user's own shell state (PATH, functions, exports they
+# set), not Hermes' per-turn session identity.
+#
+# Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
+# with one of these prefixes.
+_SNAPSHOT_EXCLUDED_ENV_REGEX = (
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+)
+
+
+def _export_dump_excluding_session_vars(tmp_path: str) -> str:
+    """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
+    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
+
+    ``export -p`` emits one ``declare -x NAME="value"`` line per exported var.
+    We drop the HERMES_SESSION_* / UI / CRON_AUTO_DELIVER lines so they never
+    persist across sessions in the shared snapshot. ``grep -vE`` returns exit 1
+    when it filters everything, so ``|| true`` keeps the pipeline's success
+    contract intact for the callers that chain on it.
+
+    The pipeline MUST be wrapped in a brace group with the redirection applied
+    to the group, not to the last pipeline segment. *tmp_path* typically embeds
+    ``$BASHPID`` for concurrency-safe temp names; a redirection attached
+    directly to ``grep`` is expanded inside grep's own pipeline subshell, where
+    ``$BASHPID`` resolves to the grep subshell's PID — while the caller's
+    follow-up ``mv $tmp`` expands in the parent shell to a DIFFERENT PID. The
+    dump then lands in an orphaned temp file and the snapshot silently never
+    updates (all exported-env persistence breaks). The brace-group redirect is
+    expanded in the current shell, keeping both expansions consistent.
+    """
+    return (
+        f"{{ export -p | grep -vE '{_SNAPSHOT_EXCLUDED_ENV_REGEX}' || true; }} "
+        f"> {tmp_path}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # BaseEnvironment
 # ---------------------------------------------------------------------------
@@ -632,7 +608,7 @@ class BaseEnvironment(ABC):
         _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
         bootstrap = (
             f"umask 077\n"
-            f"export -p > {_snap_tmp}\n"
+            f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -776,9 +752,15 @@ class BaseEnvironment(ABC):
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
+        # NOTE: the redirection must be attached to a brace group, not to the
+        # grep pipeline segment — ``_snap_tmp`` embeds ``$BASHPID``, and a
+        # redirect on grep is expanded inside grep's pipeline subshell (a
+        # different PID than the parent shell that expands the ``mv`` operand),
+        # silently orphaning the dump. See _export_dump_excluding_session_vars.
         if self._snapshot_ready:
             parts.append(
-                f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
+                f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
             )
 
@@ -987,17 +969,18 @@ class BaseEnvironment(ABC):
             "start": _now,
         }
 
-        if inactivity_timeout is None:
-            raw_inactivity = os.getenv("TERMINAL_INACTIVITY_TIMEOUT", "60")
-            if raw_inactivity.lower() in {"0", "none", "disabled", "false"}:
-                effective_inactivity = None
-            else:
-                try:
-                    effective_inactivity = float(raw_inactivity)
-                except ValueError:
-                    effective_inactivity = 60.0
-        else:
-            effective_inactivity = inactivity_timeout
+        raw_inactivity = (
+            os.getenv("TERMINAL_INACTIVITY_TIMEOUT", "0")
+            if inactivity_timeout is None
+            else inactivity_timeout
+        )
+        try:
+            parsed_inactivity = float(raw_inactivity)
+        except (TypeError, ValueError):
+            parsed_inactivity = 0.0
+        effective_inactivity = (
+            parsed_inactivity if parsed_inactivity > 0 else None
+        )
 
         # --- Debug tracing (opt-in via HERMES_DEBUG_INTERRUPT=1) -------------
         # Captures loop entry/exit, interrupt state changes, and periodic
@@ -1058,7 +1041,11 @@ class BaseEnvironment(ABC):
                 # Check for interactive prompts waiting on stdin input
                 _tail = output.get_tail(1000)
                 _prompt_match = _detect_interactive_prompt(_tail)
-                if _prompt_match and _idle_time >= 3.0:
+                if (
+                    effective_inactivity is not None
+                    and _prompt_match
+                    and _idle_time >= 3.0
+                ):
                     logger.warning(
                         "Terminating process PID %s: interactive prompt detected ('%s')",
                         _pid, _prompt_match,
@@ -1074,46 +1061,9 @@ class BaseEnvironment(ABC):
                         "returncode": 124,
                     }
 
-                # Check for desktop GUI child processes (Windows / desktop apps)
-                if _pid and _idle_time >= 3.0 and _now_mon - _activity_state["start"] >= 3.0:
-                    _gui_app = _detect_gui_child_process(_pid)
-                    if _gui_app:
-                        logger.info(
-                            "GUI application '%s' (child of PID %s) detected running on screen. Releasing terminal wait.",
-                            _gui_app, _pid,
-                        )
-                        gui_msg = (
-                            f"\n[Detected desktop GUI application '{_gui_app}' running on screen. "
-                            "Released foreground terminal execution thread so Hermes does not block waiting for the window to close.]"
-                        )
-                        return {
-                            "output": output.render(suffix=gui_msg),
-                            "returncode": 0,
-                        }
-
-                # Dynamic Process & CPU Activity Check:
-                # If output is idle for >= 10s and total CPU across process tree is < 0.5%,
-                # the process is completely sleeping, deadlocked, or stuck on stdin.
-                if _pid and _idle_time >= 10.0:
-                    _proc_act = _inspect_process_tree_activity(_pid)
-                    if _proc_act["alive"] and _proc_act["total_cpu"] < 0.5:
-                        logger.warning(
-                            "Terminating process PID %s: process tree idle (CPU: %.1f%%, no stdout output for %.1fs)",
-                            _pid, _proc_act["total_cpu"], _idle_time,
-                        )
-                        self._kill_process(proc)
-                        drain_thread.join(timeout=2)
-                        idle_msg = (
-                            f"\n[Command terminated early: Process tree is completely idle (0% CPU, no output for {int(_idle_time)}s). "
-                            "The process appears to be hanging, waiting for input, or deadlocked. "
-                            "For long-running or silent background tasks, run with background=true and notify_on_complete=true.]"
-                        )
-                        return {
-                            "output": output.render(suffix=idle_msg),
-                            "returncode": 124,
-                        }
-
-                # Check for output inactivity timeout (for active CPU processes)
+                # Check the explicit output-inactivity policy. Do not infer a
+                # hang from an instantaneous CPU sample: valid compilers,
+                # downloads, and child processes can be quiet and sleeping.
                 if effective_inactivity is not None and _idle_time >= effective_inactivity:
                     logger.warning(
                         "Terminating process PID %s: output inactivity for %.1fs",

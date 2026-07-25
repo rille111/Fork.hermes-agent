@@ -8,6 +8,7 @@ import {
   phoneLinkTarget
 } from '@/lib/phone-links'
 import { stripPreviewTargets } from '@/lib/preview-targets'
+import { linkifySessionRefs } from '@/lib/session-refs'
 
 const REASONING_BLOCK_RE = /<(think|thinking|reasoning|scratchpad|analysis)>[\s\S]*?<\/\1>\s*/gi
 const PREVIEW_MARKER_RE = /\[Preview:[^\]]+\]\(#preview[:/][^)]+\)/gi
@@ -271,9 +272,11 @@ function normalizeVisibleProse(text: string): string {
         return target && hasPhoneNumberContext(text, phoneStart, phoneEnd) ? `[${part.text}](${target})` : part.text
       }
 
-      return linkifyPhoneNumbersInMarkdown(
-        autoLinkRawUrls(
-          part.text.replace(/`{3,}/g, '').replace(LOCAL_PREVIEW_URL_RE, '$1').replace(CITATION_MARKER_RE, '')
+      return linkifySessionRefs(
+        linkifyPhoneNumbersInMarkdown(
+          autoLinkRawUrls(
+            part.text.replace(/`{3,}/g, '').replace(LOCAL_PREVIEW_URL_RE, '$1').replace(CITATION_MARKER_RE, '')
+          )
         )
       )
     })

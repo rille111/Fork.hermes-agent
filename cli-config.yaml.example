@@ -214,7 +214,7 @@ terminal:
   backend: "local"
   cwd: "."  # For local backend: "." = current directory. Ignored for remote backends unless a backend documents otherwise.
   timeout: 180
-  inactivity_timeout: 60  # Max seconds without stdout/stderr output before timing out an inactive process (0 to disable)
+  inactivity_timeout: 0  # Disabled by default; set positive quiet seconds to opt in
   # HOME policy for tool subprocesses:
   #   auto    - default: host uses your real HOME; containers use HERMES_HOME/home
   #   real    - force your real OS-user HOME
@@ -799,6 +799,14 @@ agent:
   # cleans up, and exits. Set a positive value only if you want a grace
   # window on /restart, and keep it well under systemd's TimeoutStopSec.
   # restart_drain_timeout: 0
+
+  # Upper bound (seconds) a submitted prompt waits for the deferred agent
+  # build (MCP discovery, model metadata, skills scan) before failing with a
+  # visible error. The wait is patient — the message is delivered as soon as
+  # the build completes, and a progress notice is shown past 30s — so this cap
+  # only fires on a genuinely hung build. Raise it for deployments with many
+  # slow or unreachable MCP servers. Default 600.
+  # build_wait_timeout: 600
 
   # Max app-level retry attempts for API errors (connection drops, provider
   # timeouts, 5xx, etc.) before the agent surfaces the failure. Lower this
