@@ -171,6 +171,45 @@ export const emberTheme: DesktopTheme = {
   }
 }
 
+/** Chandra's storm command deck — cool pixel sky with ember actions. */
+export const chandraTheme: DesktopTheme = {
+  name: 'chandra',
+  label: 'Chandra',
+  description: 'Pixel storm command deck with ember controls',
+  colors: {
+    background: '#070B18',
+    foreground: '#F3F6FF',
+    card: '#0E172A',
+    cardForeground: '#F3F6FF',
+    muted: '#16233B',
+    mutedForeground: '#91A0BA',
+    popover: '#111E34',
+    popoverForeground: '#F3F6FF',
+    primary: '#FF6A1A',
+    primaryForeground: '#190A02',
+    secondary: '#162C47',
+    secondaryForeground: '#D9E6F7',
+    accent: '#15324F',
+    accentForeground: '#ECF8FF',
+    border: '#253757',
+    input: '#1B2A43',
+    ring: '#38B6FF',
+    midground: '#38B6FF',
+    midgroundForeground: '#03111C',
+    composerRing: '#FF8738',
+    destructive: '#FF4D5A',
+    destructiveForeground: '#FFFFFF',
+    sidebarBackground: '#080F20',
+    sidebarBorder: '#1C2A45',
+    userBubble: '#241513',
+    userBubbleBorder: '#FF6A1A'
+  },
+  typography: {
+    fontSans: SYSTEM_SANS,
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`
+  }
+}
+
 /** Clean grayscale. Matches the CLI mono skin and dashboard mono theme. */
 export const monoTheme: DesktopTheme = {
   name: 'mono',
@@ -281,6 +320,7 @@ export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
   nous: nousTheme,
   midnight: midnightTheme,
   ember: emberTheme,
+  chandra: chandraTheme,
   mono: monoTheme,
   cyberpunk: cyberpunkTheme,
   slate: slateTheme
