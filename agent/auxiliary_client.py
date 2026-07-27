@@ -4674,15 +4674,15 @@ def _resolve_auto(
     if main_provider == "moa":
         _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)
         if _agg_provider and _agg_model:
-                main_provider = _agg_provider
-                main_model = _agg_model
-                # The MoA virtual runtime carries a non-HTTP base_url
-                # ("moa://local") and a placeholder api_key; they belong to the
-                # facade, not the aggregator's real provider. Drop them so the
-                # aggregator resolves through its own provider credentials.
-                runtime_base_url = ""
-                runtime_api_key = ""
-                runtime_api_mode = ""
+            main_provider = _agg_provider
+            main_model = _agg_model
+            # The MoA virtual runtime carries a non-HTTP base_url
+            # ("moa://local") and a placeholder api_key; they belong to the
+            # facade, not the aggregator's real provider. Drop them so the
+            # aggregator resolves through its own provider credentials.
+            runtime_base_url = ""
+            runtime_api_key = ""
+            runtime_api_mode = ""
 
     if (main_provider and main_model
             and main_provider not in {"auto", ""}):
