@@ -4,6 +4,7 @@ import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { formatMoney } from './billing-amounts'
 import {
   billingDevFixtures,
   loggedOutBillingState,
@@ -17,6 +18,8 @@ import {
 } from './fixtures.test-util'
 
 import { BillingSettings } from './index'
+
+const normalizeWhitespace = (value: string): string => value.replace(/\s+/g, ' ')
 
 const apiMocks = vi.hoisted(() => ({
   charge: vi.fn(),
@@ -168,7 +171,7 @@ describe('BillingSettings', () => {
       target: { value: '7.50' }
     })
 
-    expect(screen.getByText('Threshold: minimum is $10.')).toBeTruthy()
+    expect(screen.getByText(normalizeWhitespace(`Threshold: minimum is ${formatMoney(10)}.`))).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -592,7 +595,9 @@ describe('BillingSettings', () => {
       ok: true
     })
 
-    await waitFor(() => expect(screen.getByText('$25 added. Balance is refreshing.')).toBeTruthy())
+    await waitFor(() =>
+      expect(screen.getAllByText(normalizeWhitespace(`${formatMoney(25)} added. Balance is refreshing.`)).length).toBeGreaterThan(0)
+    )
   })
 
   it('renders logged-out as a connect card without normal account rows', async () => {

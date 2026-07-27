@@ -282,15 +282,17 @@ class TestRecordFileMutationResult:
             json.dumps({"error": "x"}), is_error=True,
         )
 
-    def test_missing_path_arg_recorded_nowhere(self):
+    def test_missing_path_arg_records_unknown_target(self):
+        from agent.file_mutation_verifier import _UNKNOWN_MUTATION_TARGET
+
         agent = _bare_agent()
         agent._record_file_mutation_result(
             "patch", {"mode": "replace"},  # no path
             json.dumps({"error": "path required"}), is_error=True,
         )
-        # No path → nothing to key on, state stays empty.  The per-turn
-        # state is about file paths, not individual tool-call IDs.
-        assert agent._turn_failed_file_mutations == {}
+        assert agent._turn_failed_file_mutations == {
+            _UNKNOWN_MUTATION_TARGET: {"tool": "patch", "error_preview": "path required"}
+        }
 
 
 # ---------------------------------------------------------------------------

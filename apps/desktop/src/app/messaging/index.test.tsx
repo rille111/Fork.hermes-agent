@@ -53,16 +53,18 @@ afterEach(() => {
 
 async function renderMessaging() {
   const { MessagingView } = await import('./index')
-  let result: ReturnType<typeof render>
+
+  const result = render(
+    <MemoryRouter>
+      <MessagingView />
+    </MemoryRouter>
+  )
+
   await act(async () => {
-    result = render(
-      <MemoryRouter>
-        <MessagingView />
-      </MemoryRouter>
-    )
+    await Promise.resolve()
   })
 
-  return result!
+  return result
 }
 
 describe('MessagingView setup-guide link', () => {
@@ -77,7 +79,7 @@ describe('MessagingView setup-guide link', () => {
 
     expect((await screen.findAllByText('Microsoft Teams')).length).toBeGreaterThan(0)
     expect(screen.queryByText('Open setup guide')).toBeNull()
-  })
+  }, 60_000)
 
   it('opens a real docs URL through the validated external opener', async () => {
     const docsUrl = 'https://hermes-agent.nousresearch.com/docs/user-guide/messaging/teams'

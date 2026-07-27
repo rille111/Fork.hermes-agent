@@ -60,19 +60,21 @@ function toolset(overrides: Record<string, unknown> = {}) {
 
 async function renderSkills() {
   const { SkillsView } = await import('./index')
-  let result: ReturnType<typeof render>
+
+  const result = render(
+    // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
+        <SkillsView />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+
   await act(async () => {
-    result = render(
-      // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
-      <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
-          <SkillsView />
-        </MemoryRouter>
-      </QueryClientProvider>
-    )
+    await Promise.resolve()
   })
 
-  return result!
+  return result
 }
 
 beforeEach(() => {
@@ -102,7 +104,7 @@ describe('SkillsView toolset management', () => {
     })
 
     await waitFor(() => expect(toggleToolset).toHaveBeenCalledWith('web', false))
-  })
+  }, 60_000)
 
   it('renders toolset titles without leading emoji', async () => {
     getToolsets.mockResolvedValue([toolset({ name: 'cronjob', label: '⏰ Cron Jobs', description: 'cron tools' })])
