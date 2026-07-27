@@ -853,6 +853,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                     0.0,
                                     True,
                                     False,
+                                    False,
                                     middleware_trace,
                                 )
                         break

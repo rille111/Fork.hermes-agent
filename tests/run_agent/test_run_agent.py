@@ -2723,8 +2723,8 @@ class TestConcurrentToolExecution:
                 mock_seq.assert_called_once()
                 mock_con.assert_not_called()
 
-    def test_disjoint_write_batch_uses_concurrent_path(self, agent):
-        """Independent file writes should still run concurrently."""
+    def test_disjoint_write_batch_forces_sequential(self, agent):
+        """Structured mutations stay ordered because middleware can alias paths."""
         tc1 = _mock_tool_call(
             name="write_file",
             arguments='{"path":"src/a.py","content":"print(1)"}',
@@ -2740,8 +2740,8 @@ class TestConcurrentToolExecution:
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
             with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_con.assert_called_once()
-                mock_seq.assert_not_called()
+                mock_seq.assert_called_once()
+                mock_con.assert_not_called()
 
     def test_overlapping_write_batch_forces_sequential(self, agent):
         """Writes to the same file must stay ordered."""
@@ -3770,7 +3770,7 @@ class TestParallelScopePathNormalization:
 
         monkeypatch.chdir(tmp_path)
 
-        scoped = _extract_parallel_scope_path("write_file", {"path": "./notes.txt"})
+        scoped = _extract_parallel_scope_path("read_file", {"path": "./notes.txt"})
 
         assert scoped == tmp_path / "notes.txt"
 
@@ -3780,8 +3780,8 @@ class TestParallelScopePathNormalization:
         monkeypatch.chdir(tmp_path)
         abs_path = tmp_path / "notes.txt"
 
-        rel_scoped = _extract_parallel_scope_path("write_file", {"path": "notes.txt"})
-        abs_scoped = _extract_parallel_scope_path("write_file", {"path": str(abs_path)})
+        rel_scoped = _extract_parallel_scope_path("read_file", {"path": "notes.txt"})
+        abs_scoped = _extract_parallel_scope_path("read_file", {"path": str(abs_path)})
 
         assert rel_scoped == abs_scoped
         assert _paths_overlap(rel_scoped, abs_scoped)
