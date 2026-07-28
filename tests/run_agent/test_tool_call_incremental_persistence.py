@@ -23,6 +23,7 @@ makes the corresponding assertion fail.
 """
 
 import copy
+import json
 from types import SimpleNamespace
 from pathlib import Path
 import tempfile
@@ -30,6 +31,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.file_mutation_verifier import TurnFileMutationVerifier
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.agent_runtime_helpers import sanitize_api_messages
 from agent.tool_executor import execute_tool_calls_segmented
@@ -51,13 +53,15 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def _make_agent():
+def _make_agent(*tool_names: str):
+    if not tool_names:
+        tool_names = ("web_search",)
     hermes_home = Path(tempfile.mkdtemp(prefix="hermes-test-home-"))
     (hermes_home / "logs").mkdir(parents=True, exist_ok=True)
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_make_tool_defs("web_search"),
+            return_value=_make_tool_defs(*tool_names),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -491,3 +495,67 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("dispatch_mode", "quiet_mode"),
+    [
+        ("sequential", True),
+        ("sequential", False),
+        ("concurrent", True),
+    ],
+)
+def test_file_mutation_verifier_uses_middleware_dispatched_args(
+    tmp_path, monkeypatch, dispatch_mode, quiet_mode,
+):
+    original = tmp_path / "original.txt"
+    redirected = tmp_path / "redirected.txt"
+    agent = _make_agent("write_file")
+    agent.quiet_mode = quiet_mode
+    agent._turn_failed_file_mutations = {}
+    agent._turn_file_mutation_paths = set()
+    agent._file_mutation_verifier = TurnFileMutationVerifier()
+    agent._file_mutation_verifier.reset_turn(1)
+    agent._flush_messages_to_session_db = MagicMock()
+    agent._checkpoint_mgr.enabled = True
+    checkpoint_paths: list[str] = []
+
+    def _rewrite(name, args, execute, **kwargs):
+        return execute({**args, "path": str(redirected)})
+
+    def _failed_dispatch(name, args, **kwargs):
+        Path(args["path"]).write_text("partial\n", encoding="utf-8")
+        return json.dumps({"success": False, "error": "simulated failure"})
+
+    def _capture_checkpoint(agent, function_name, function_args, task_id):
+        checkpoint_paths.append(function_args["path"])
+
+    tool_call = _mock_tool_call(
+        name="write_file",
+        arguments=json.dumps({"path": str(original), "content": "requested\n"}),
+    )
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    messages: list = []
+
+    with (
+        patch(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            side_effect=_rewrite,
+        ),
+        patch("model_tools.registry.dispatch", side_effect=_failed_dispatch),
+        patch(
+            "agent.tool_executor._ensure_file_checkpoint",
+            side_effect=_capture_checkpoint,
+        ),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        execute = getattr(agent, f"_execute_tool_calls_{dispatch_mode}")
+        execute(assistant_message, messages, "task-1")
+
+    failed = agent._turn_failed_file_mutations
+    assert str(redirected) in failed
+    assert str(original) not in failed
+    assert checkpoint_paths == [str(redirected)]

@@ -27,7 +27,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Callable, Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -569,15 +569,10 @@ def _compute_tool_definitions(
                 config=ts_cfg,
             )
             if assembly.activated and not quiet_mode:
-                _forms = {"full": "catalog listing embedded",
-                          "names": "names-only listing embedded",
-                          "mixed": "listing embedded (oversized servers summarized)",
-                          "groups": "server summary embedded (search-only discovery)",
-                          "none": "no listing (search-only)"}
                 print(
-                    f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
-                    f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
-                    f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
+                    f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
+                    f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
+                    f"Threshold ~{assembly.threshold_tokens} tokens."
                 )
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
@@ -730,16 +725,6 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     properties = (schema.get("parameters") or {}).get("properties")
     if not properties:
         return args
-
-    # The model saw the SANITIZED schema — property keys violating provider
-    # patterns (e.g. Cloudflare's ``issue_class~neq``) were renamed before
-    # the request. Map any sanitized keys back to the registry's original
-    # wire names before schema lookup / dispatch.
-    try:
-        from tools.schema_sanitizer import unrename_tool_args
-        args = unrename_tool_args(schema.get("parameters"), args)
-    except Exception:  # pragma: no cover — never break dispatch
-        pass
 
     for key, value in list(args.items()):
         prop_schema = properties.get(key)
@@ -1096,6 +1081,8 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    observed_dispatch_out: Optional[Dict[str, Any]] = None,
+    before_dispatch: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1185,12 +1172,6 @@ def handle_function_call(
                         "Use tool_search to find tools you can call."
                     ),
                 }, ensure_ascii=False)
-            # Probe-validate against the deferred tool's schema (ironclaw#5149):
-            # a blind call missing required arguments returns the parameter
-            # schema instead of dispatching into an opaque downstream failure.
-            _probe_err = _ts_mod.validate_deferred_call_args(underlying_name, underlying_args)
-            if _probe_err is not None:
-                return _probe_err
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
             return handle_function_call(
@@ -1322,25 +1303,46 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            def _observe_dispatch(next_args: Dict[str, Any]) -> None:
+                if isinstance(observed_dispatch_out, dict):
+                    observed_dispatch_out["args"] = dict(next_args)
+                if callable(before_dispatch):
+                    try:
+                        before_dispatch(dict(next_args))
+                    except Exception as observer_error:
+                        logger.debug(
+                            "before-dispatch observer failed for %s: %s",
+                            function_name,
+                            observer_error,
+                        )
+
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    _observe_dispatch(next_args)
+                    dispatch_result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
+                    if isinstance(observed_dispatch_out, dict):
+                        observed_dispatch_out["result"] = dispatch_result
+                    return dispatch_result
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    _observe_dispatch(next_args)
+                    dispatch_result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
+                    if isinstance(observed_dispatch_out, dict):
+                        observed_dispatch_out["result"] = dispatch_result
+                    return dispatch_result
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(

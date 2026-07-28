@@ -41,6 +41,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.turn_finalizer import finalize_turn
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -105,6 +106,11 @@ INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model r
 # itself, so every exception passes through them, which would make
 # _hit_local always True and misclassify transient API/network errors as
 # non-retryable local bugs. (#66267)
+#
+# AttributeError is handled separately in the outer except block — it is
+# ALWAYS a local programming bug when it targets agent attributes (especially
+# missing methods introduced by a commit splice after an auto-update rewrites
+# source underneath a live process). See the dedicated guard below. (#68178)
 _LOCAL_PROCESSING_MODULES = frozenset({
     "agent_runtime_helpers",
     "message_content",
@@ -1259,6 +1265,29 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # ── Code skew guard (#68178) ───────────────────────────────
+        # Check whether the source tree has been updated underneath this
+        # long-lived process. A lazy import can otherwise resolve new symbols
+        # against the stale in-memory AIAgent class. Stop at the iteration
+        # boundary so the transcript remains valid and the user can restart
+        # without losing the already-persisted turn history.
+        _skew_warning = getattr(agent, "_check_code_skew_before_turn", lambda: None)()
+        if _skew_warning:
+            logger.warning(
+                "Code skew detected at API call #%d: %s",
+                api_call_count + 1,
+                _skew_warning,
+            )
+            _turn_exit_reason = "code_skew_detected"
+            final_response = (
+                "I apologize, but the agent detected that its source code was "
+                "updated while it was running. Please restart the application "
+                f"to apply the update safely. ({_skew_warning})"
+            )
+            failed = True
+            messages.append({"role": "assistant", "content": final_response})
+            break
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1268,7 +1297,6 @@ def run_conversation(
                     f"User correction during the turn: {_redirect_text}"
                 )
             agent._persist_session(messages, conversation_history)
-
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
@@ -2767,12 +2795,17 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    _has_reasoning_data = bool(
+                        agent._extract_reasoning(_trunc_msg)
+                        or getattr(_trunc_msg, "reasoning_content", None)
+                        or getattr(_trunc_msg, "reasoning", None)
+                    )
                     _thinking_exhausted = (
                         not _trunc_has_tool_calls
-                        and _has_think_tags
+                        and (_has_think_tags or _has_reasoning_data)
                         and (
                             (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
-                            or _trunc_content is None
+                            or not _trunc_content
                         )
                     )
 
@@ -2922,6 +2955,16 @@ def run_conversation(
                                 }
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
+
+                                # Boost ephemeral max output tokens for text continuation retries
+                                _cont_boost_base = agent.max_tokens if agent.max_tokens else 8192
+                                _cont_boost = _cont_boost_base * (2 ** length_continue_retries)
+                                _cont_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
+                                if _cont_requested_cap is not None:
+                                    _cont_boost = max(_cont_boost, _cont_requested_cap)
+                                _cont_boost_cap = max(65536, _cont_requested_cap or 0)
+                                agent._ephemeral_max_output_tokens = min(_cont_boost, _cont_boost_cap)
+
                                 _retry.restart_with_length_continuation = True
                                 break
 
@@ -6897,7 +6940,24 @@ def run_conversation(
 
             _is_local_processing_error = _hit_local and not _hit_api
 
-            if _is_local_processing_error:
+            # An AttributeError is evidence of commit-splice skew only when
+            # the boot-vs-disk fingerprint guard independently confirms it.
+            # run_agent is a common wrapper in otherwise unrelated SDK/model
+            # AttributeErrors, so traceback membership alone is not enough.
+            _is_code_skew_attribute_error = bool(
+                isinstance(e, AttributeError)
+                and getattr(
+                    agent,
+                    "_check_code_skew_before_turn",
+                    lambda: None,
+                )()
+            )
+
+            if _is_code_skew_attribute_error:
+                error_msg = (
+                    f"Fatal local code error in API call #{api_call_count}: {str(e)}"
+                )
+            elif _is_local_processing_error:
                 error_msg = (
                     f"Error during local message processing after "
                     f"OpenAI-compatible API call #{api_call_count}: {str(e)}"
@@ -6951,13 +7011,22 @@ def run_conversation(
             # role-alternation invariants.
 
             # If we're near the limit, break to avoid infinite loops.
-            # Local processing errors are deterministic — stop immediately
-            # rather than retrying until the budget is exhausted.
+            # Local processing errors and agent AttributeError (commit-splice
+            # symptom) are deterministic — stop immediately rather than
+            # retrying until the budget is exhausted. (#68178)
             if (
-                _is_local_processing_error
+                _is_code_skew_attribute_error
+                or _is_local_processing_error
                 or api_call_count >= agent.max_iterations - 1
             ):
-                if _is_local_processing_error:
+                if _is_code_skew_attribute_error:
+                    _turn_exit_reason = f"code_skew_attribute_error({error_msg[:80]})"
+                    final_response = (
+                        f"I apologize, but the agent process has detected a code "
+                        f"mismatch (running stale code after an update). "
+                        f"Please restart the application. Error: {error_msg}"
+                    )
+                elif _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"
                 else:
@@ -6971,7 +7040,6 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    from agent.turn_finalizer import finalize_turn
     return finalize_turn(
         agent,
         final_response=final_response,

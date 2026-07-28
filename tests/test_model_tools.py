@@ -201,6 +201,71 @@ class TestHandleFunctionCall:
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
 
+    def test_dispatch_observer_keeps_effective_args_and_raw_result_before_transform(
+        self,
+        monkeypatch,
+    ):
+        raw_result = json.dumps({"error": "partial mutation failed"})
+        visible_result = json.dumps({"success": True})
+        dispatch_events = []
+
+        def execution_middleware(**kwargs):
+            assert kwargs["next_call"]({**kwargs["args"], "effective": True}) == raw_result
+            return visible_result
+
+        manager = type(
+            "Manager",
+            (),
+            {"_middleware": {"tool_request": [], "tool_execution": [execution_middleware]}},
+        )()
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: False)
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda _name, args, **_kwargs: (
+                dispatch_events.append(("dispatch", dict(args))) or raw_result
+            ),
+        )
+        observed = {}
+
+        result = handle_function_call(
+            "patch",
+            {"mode": "replace", "path": "target.txt"},
+            task_id="task-1",
+            observed_dispatch_out=observed,
+            before_dispatch=lambda args: dispatch_events.append(
+                ("before", dict(args)),
+            ),
+        )
+
+        assert result == visible_result
+        assert observed == {
+            "args": {
+                "mode": "replace",
+                "path": "target.txt",
+                "effective": True,
+            },
+            "result": raw_result,
+        }
+        assert dispatch_events == [
+            (
+                "before",
+                {
+                    "mode": "replace",
+                    "path": "target.txt",
+                    "effective": True,
+                },
+            ),
+            (
+                "dispatch",
+                {
+                    "mode": "replace",
+                    "path": "target.txt",
+                    "effective": True,
+                },
+            ),
+        ]
+
 
 # =========================================================================
 # Agent loop tools

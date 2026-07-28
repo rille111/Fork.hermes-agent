@@ -1,5 +1,11 @@
 import { getSession } from '@/hermes'
-import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
+import {
+  assistantTextPart,
+  type ChatMessage,
+  chatMessageText,
+  comparableUserMessageText,
+  textPart
+} from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages, textWithoutImageRefs } from '@/lib/embedded-images'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -454,7 +460,9 @@ export function appendLiveSessionProjection(
   }
 
   const persistedInLatestRun = (text: string): boolean =>
-    latestUserRun.some(message => textWithoutImageRefs(chatMessageText(message)) === textWithoutImageRefs(text))
+    latestUserRun.some(
+      message => comparableUserMessageText(chatMessageText(message)) === comparableUserMessageText(text)
+    )
 
   const inflightUserAlreadyPersisted = Boolean(inflightUser) && persistedInLatestRun(inflightUser)
 

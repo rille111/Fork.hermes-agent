@@ -156,7 +156,10 @@ class TestRuntimeProvider:
         monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
 
         with patch("hermes_cli.runtime_provider.resolve_provider", return_value="bedrock"), \
-             patch("hermes_cli.runtime_provider._get_model_config", return_value={"provider": "bedrock"}):
+             patch("hermes_cli.runtime_provider._get_model_config", return_value={"provider": "bedrock"}), \
+             patch("hermes_cli.runtime_provider.load_config", return_value={}), \
+             patch("botocore.session.get_session") as mock_botocore_session:
+            mock_botocore_session.return_value.get_config_variable.return_value = None
             result = resolve_runtime_provider(requested="bedrock")
 
         assert result["region"] == "us-east-1"

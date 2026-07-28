@@ -348,6 +348,32 @@ describe('renderMediaTags', () => {
     expect(renderMediaTags('MEDIA:/tmp/demo.mp4')).toBe('[Video: demo.mp4](#media:%2Ftmp%2Fdemo.mp4)')
   })
 
+  it('keeps spaces in a standalone unquoted Windows MEDIA path', () => {
+    const path =
+      'C:\\Users\\ADMIN\\OneDrive\\Priv - Hermes Projects\\Person-researcher\\exports\\dos-20260724-olle-bergstedt.pdf'
+
+    expect(renderMediaTags(`MEDIA:${path}`)).toBe(
+      `[File: dos-20260724-olle-bergstedt.pdf](#media:${encodeURIComponent(path)})`
+    )
+  })
+
+  it.each([
+    ['LF', '\n'],
+    ['CRLF', '\r\n']
+  ])('keeps spaces in consecutive standalone MEDIA paths with %s line endings', (_label, newline) => {
+    const firstPath = 'C:\\Users\\ADMIN\\My Files\\first report.pdf'
+    const secondPath = '\\\\server\\Shared Files\\second report.pdf'
+
+    expect(renderMediaTags(`MEDIA:${firstPath}${newline}MEDIA:${secondPath}`)).toBe(
+      `[File: first report.pdf](#media:${encodeURIComponent(firstPath)})${newline}` +
+        `[File: second report.pdf](#media:${encodeURIComponent(secondPath)})`
+    )
+  })
+
+  it('does not consume the following line when a MEDIA path is blank', () => {
+    expect(renderMediaTags('before\nMEDIA:   \nnot-a-path')).toBe('before\nMEDIA:\nnot-a-path')
+  })
+
   it('renders streamed assistant media once the tag is complete', () => {
     const parts = appendAssistantTextPart(appendAssistantTextPart([], 'ok\nMEDIA:'), '/tmp/voice.mp3')
     const text = chatMessageText({ id: 'a', role: 'assistant', parts })
@@ -477,6 +503,41 @@ describe('preserveLocalAssistantErrors', () => {
       },
       {
         error: 'OpenRouter 403',
+        id: 'assistant-error-1',
+        parts: [],
+        role: 'assistant'
+      }
+    ]
+
+    const merged = preserveLocalAssistantErrors(nextMessages, currentMessages)
+
+    expect(merged.map(message => message.id)).toEqual(['stored-user', 'assistant-error-1'])
+  })
+
+  it('aligns a local error with an image turn persisted with screenshot placeholders', () => {
+    const caption = 'Switched away and back'
+
+    const nextMessages: ChatMessage[] = [
+      {
+        id: 'stored-user',
+        parts: [
+          {
+            text: `${caption}\n\n[Image attached at: C:\\shots\\one.png]\n[screenshot]`,
+            type: 'text'
+          }
+        ],
+        role: 'user'
+      }
+    ]
+
+    const currentMessages: ChatMessage[] = [
+      {
+        id: 'optimistic-user',
+        parts: [{ text: caption, type: 'text' }],
+        role: 'user'
+      },
+      {
+        error: 'Provider failed',
         id: 'assistant-error-1',
         parts: [],
         role: 'assistant'

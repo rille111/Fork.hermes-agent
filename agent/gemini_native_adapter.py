@@ -47,6 +47,13 @@ DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # internal default and truncates output (unlike OpenAI-compat endpoints where
 # an omitted limit means full budget).
 GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 65535
+GEMMA_DEFAULT_MAX_OUTPUT_TOKENS = 8192
+
+
+def _is_gemma_model(model: str | None) -> bool:
+    if not model:
+        return False
+    return "gemma" in model.lower()
 
 
 def bare_gemini_model_id(model: str) -> str:
@@ -388,17 +395,30 @@ def _build_gemini_contents(messages: List[Dict[str, Any]]) -> tuple[List[Dict[st
         if parts:
             contents.append({"role": gemini_role, "parts": parts})
 
-    # Gemini's generateContent requires strict user/model alternation;
-    # consecutive same-role contents are rejected with HTTP 400 "Please ensure
-    # that multiturn requests alternate between user and model". The loop above
-    # emits one content per source message, so parallel tool calls (N tool
-    # results become N user functionResponse contents), back-to-back user turns,
-    # or merged assistant turns would each violate that. Merge adjacent
-    # same-role contents by concatenating their parts. For parallel calls this
-    # also produces the grouped multi-functionResponse turn Gemini expects.
+    # Group adjacent contents when they represent the same kind of turn. This
+    # keeps parallel tool results in the single multi-functionResponse turn
+    # Gemini expects. A functionResponse boundary is special, though: folding a
+    # later human message into that same user content is accepted with HTTP 200
+    # by Gemini 3 but produces an empty model response. Keep those turns
+    # separate; current Gemini APIs accept consecutive user contents here.
     merged_contents: List[Dict[str, Any]] = []
     for content in contents:
-        if merged_contents and merged_contents[-1]["role"] == content["role"]:
+        same_role = bool(
+            merged_contents and merged_contents[-1]["role"] == content["role"]
+        )
+        if same_role and content["role"] == "user":
+            previous_has_function_response = any(
+                isinstance(part, dict) and "functionResponse" in part
+                for part in merged_contents[-1].get("parts", [])
+            )
+            current_has_function_response = any(
+                isinstance(part, dict) and "functionResponse" in part
+                for part in content.get("parts", [])
+            )
+            if previous_has_function_response != current_has_function_response:
+                same_role = False
+
+        if same_role:
             merged_contents[-1]["parts"].extend(content["parts"])
         else:
             merged_contents.append(content)
@@ -472,6 +492,7 @@ def _normalize_thinking_config(config: Any) -> Optional[Dict[str, Any]]:
 def build_gemini_request(
     *,
     messages: List[Dict[str, Any]],
+    model: Optional[str] = None,
     tools: Any = None,
     tool_choice: Any = None,
     temperature: Optional[float] = None,
@@ -499,17 +520,20 @@ def build_gemini_request(
     if max_tokens is not None:
         generation_config["maxOutputTokens"] = max_tokens
     else:
-        # Gemini's native generateContent does NOT treat an omitted
-        # maxOutputTokens as "use the model's full output budget" — it applies
-        # a low internal default and the model stops early with
-        # finishReason=MAX_TOKENS, truncating tool calls mid-stream (Hermes
-        # then retries 3× and refuses the incomplete call). Every current
-        # Gemini text model (2.5 + 3.x, flash / flash-lite / pro) caps at
-        # 65,535 output tokens, so default to that ceiling when the caller
-        # passes None ("unlimited"). See the OpenAI-compat path where omitting
-        # the field genuinely means full budget — that assumption does not
-        # hold on the native API.
-        generation_config["maxOutputTokens"] = GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
+        if _is_gemma_model(model):
+            generation_config["maxOutputTokens"] = GEMMA_DEFAULT_MAX_OUTPUT_TOKENS
+        else:
+            # Gemini's native generateContent does NOT treat an omitted
+            # maxOutputTokens as "use the model's full output budget" — it applies
+            # a low internal default and the model stops early with
+            # finishReason=MAX_TOKENS, truncating tool calls mid-stream (Hermes
+            # then retries 3× and refuses the incomplete call). Every current
+            # Gemini text model (2.5 + 3.x, flash / flash-lite / pro) caps at
+            # 65,535 output tokens, so default to that ceiling when the caller
+            # passes None ("unlimited"). See the OpenAI-compat path where omitting
+            # the field genuinely means full budget — that assumption does not
+            # hold on the native API.
+            generation_config["maxOutputTokens"] = GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
     if top_p is not None:
         generation_config["topP"] = top_p
     if stop:
@@ -995,6 +1019,7 @@ class GeminiNativeClient:
 
         request = build_gemini_request(
             messages=messages or [],
+            model=model,
             tools=tools,
             tool_choice=tool_choice,
             temperature=temperature,

@@ -85,6 +85,14 @@ class TestSlashCommandPrefixMatching:
             printed = " ".join(str(c) for c in mock_cprint.call_args_list)
         assert "Unknown command" in printed
 
+    def test_removed_delete_project_command_shows_error(self):
+        """The incomplete destructive command must behave like any unknown command."""
+        cli_obj = _make_cli()
+        with patch("cli._cprint") as mock_cprint:
+            cli_obj.process_command("/delete-project")
+            printed = " ".join(str(c) for c in mock_cprint.call_args_list)
+        assert "Unknown command" in printed
+
     def test_exact_command_still_works(self):
         """/help should still work as exact match."""
         cli_obj = _make_cli()

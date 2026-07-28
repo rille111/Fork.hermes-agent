@@ -135,5 +135,6 @@ def test_resolve_workspace_falls_back_to_file_location(tmp_path: Path, monkeypat
 
 def test_normalize_path_expands_tilde(monkeypatch):
     monkeypatch.setenv("HOME", "/home/user")
+    monkeypatch.setenv("USERPROFILE", "/home/user")
     p = normalize_path("~/x.py")
     assert p == os.path.abspath("/home/user/x.py")

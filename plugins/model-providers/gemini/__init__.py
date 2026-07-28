@@ -18,6 +18,16 @@ from providers.base import ProviderProfile
 class GeminiProfile(ProviderProfile):
     """Gemini — translate reasoning_config to thinking_config in extra_body."""
 
+    def get_max_tokens(self, model: str | None) -> int | None:
+        """Gemini text models support up to 65,535 output tokens, while Gemma
+        models on the same API support 8192. Default to the appropriate max
+        when user hasn't set an explicit max_tokens to prevent premature truncation.
+        """
+        from agent.gemini_native_adapter import _is_gemma_model
+        if _is_gemma_model(model):
+            return 8192
+        return 65535
+
     def build_extra_body(
         self, *, session_id: str | None = None, **context: Any
     ) -> dict[str, Any]:

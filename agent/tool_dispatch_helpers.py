@@ -152,6 +152,13 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             _add_sequential(tool_call)
             continue
 
+        # Structured mutations are serialized even when their original paths
+        # are disjoint: execution middleware may rewrite both calls to the same
+        # physical target after this planner runs.
+        if tool_name in _FILE_MUTATING_TOOLS:
+            _add_sequential(tool_call)
+            continue
+
         try:
             function_args = json.loads(tool_call.function.arguments)
         except Exception:
@@ -353,26 +360,17 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
         body = args.get("patch") or ""
         if not isinstance(body, str) or not body:
             return []
+        from tools.patch_parser import OperationType, parse_v4a_patch
+
+        operations, parse_error = parse_v4a_patch(body)
+        if parse_error:
+            return []
         paths: List[str] = []
-        for _m in re.finditer(
-            r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            p = _m.group(1).strip()
-            if p:
-                paths.append(p)
-        for _m in re.finditer(
-            r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            src = _m.group(1).strip()
-            dst = _m.group(2).strip()
-            if src:
-                paths.append(src)
-            if dst:
-                paths.append(dst)
+        for operation in operations:
+            if operation.file_path:
+                paths.append(operation.file_path)
+            if operation.operation == OperationType.MOVE and operation.new_path:
+                paths.append(operation.new_path)
         return paths
     return []
 
@@ -382,28 +380,14 @@ def _extract_landed_file_mutation_paths(
     args: Dict[str, Any],
     result: Any,
 ) -> List[str]:
-    """Return the concrete file paths a successful mutation reports."""
-    targets = _extract_file_mutation_targets(tool_name, args)
-    if tool_name not in _FILE_MUTATING_TOOLS or not isinstance(result, str):
-        return targets
-    try:
-        data = json.loads(result.strip())
-    except Exception:
-        return targets
-    if not isinstance(data, dict):
-        return targets
+    """Return only paths declared by the effective mutation arguments.
 
-    files = data.get("files_modified")
-    if isinstance(files, list):
-        landed = [str(p) for p in files if p]
-        if landed:
-            return landed
-
-    resolved = data.get("resolved_path")
-    if resolved:
-        return [str(resolved)]
-
-    return targets
+    Result payloads can be rewritten by middleware and are not path authority.
+    A reported ``files_modified``/``resolved_path`` value may describe an alias,
+    but it must never register or reconcile an undeclared target.
+    """
+    del result
+    return _extract_file_mutation_targets(tool_name, args)
 
 
 def _extract_error_preview(result: Any, max_len: int = 180) -> str:

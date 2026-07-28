@@ -167,40 +167,75 @@ _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
 
 
-def _terminal_env_type_for_task(task_id: str = "default") -> str:
-    """Best-effort terminal backend type for path-resolution decisions."""
-    try:
-        from tools.terminal_tool import (
-            _active_environments,
-            _env_lock,
-            _get_env_config,
-            _resolve_container_task_id,
-        )
+def _detect_terminal_env_type_for_task(task_id: str) -> str:
+    """Return the configured backend type, propagating lookup failures."""
+    from tools.terminal_tool import (
+        _active_environments,
+        _env_lock,
+        _get_env_config,
+        _resolve_container_task_id,
+    )
 
-        try:
-            container_key = _resolve_container_task_id(task_id)
-        except Exception:
-            container_key = task_id
-        with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
-        if env is not None:
-            name = env.__class__.__name__.lower()
-            if "local" in name:
-                return "local"
-            if "ssh" in name:
-                return "ssh"
-            if "docker" in name:
-                return "docker"
-            if "singularity" in name:
-                return "singularity"
-            if "modal" in name:
-                return "modal"
-            if "daytona" in name:
-                return "daytona"
-        cfg = _get_env_config()
-        return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
+    try:
+        container_key = _resolve_container_task_id(task_id)
+    except Exception:
+        container_key = task_id
+    with _env_lock:
+        env = _active_environments.get(container_key) or _active_environments.get(task_id)
+    if env is not None:
+        name = env.__class__.__name__.lower()
+        if "local" in name:
+            return "local"
+        if "ssh" in name:
+            return "ssh"
+        if "docker" in name:
+            return "docker"
+        if "singularity" in name:
+            return "singularity"
+        if "modal" in name:
+            return "modal"
+        if "daytona" in name:
+            return "daytona"
+    cfg = _get_env_config()
+    return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
+
+
+def _terminal_env_type_for_task(task_id: str = "default") -> str:
+    """Best-effort terminal backend type for ordinary file-tool operation."""
+    try:
+        return _detect_terminal_env_type_for_task(task_id)
     except Exception:
         return str(os.getenv("TERMINAL_ENV") or "local").lower()
+
+
+def _terminal_env_type_for_task_strict(task_id: str = "default") -> str:
+    """Return a backend type without treating lookup failure as local."""
+    try:
+        return _detect_terminal_env_type_for_task(task_id)
+    except Exception:
+        return "unknown"
+
+
+def _resolve_local_path_for_task_lexically(
+    filepath: str,
+    task_id: str = "default",
+) -> Path:
+    """Resolve a local task path without dereferencing target components."""
+    from tools.environments.local import _msys_to_windows_path
+
+    expanded = _expand_tilde(_msys_to_windows_path(filepath))
+    if sys.platform == "win32":
+        import ntpath
+
+        if ntpath.isabs(expanded):
+            return Path(ntpath.normpath(expanded))
+        base = _authoritative_workspace_root(task_id) or os.getcwd()
+        return Path(ntpath.normpath(ntpath.join(str(base), expanded)))
+
+    if os.path.isabs(expanded):
+        return Path(os.path.normpath(expanded))
+    base = _authoritative_workspace_root(task_id) or os.getcwd()
+    return Path(os.path.normpath(os.path.join(str(base), expanded)))
 
 
 def _uses_container_paths(task_id: str = "default") -> bool:

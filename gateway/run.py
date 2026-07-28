@@ -1905,6 +1905,7 @@ if _config_path.exists():
                 "backend": "TERMINAL_ENV",
                 "cwd": "TERMINAL_CWD",
                 "timeout": "TERMINAL_TIMEOUT",
+                "inactivity_timeout": "TERMINAL_INACTIVITY_TIMEOUT",
                 "home_mode": "TERMINAL_HOME_MODE",
                 "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
                 "docker_image": "TERMINAL_DOCKER_IMAGE",
@@ -17902,20 +17903,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     description = result.get("analysis", "")
                     description = sanitize_context(description)
                     enriched_parts.append(
-                        f"[The user sent an image~ Here's what I can see:\n{description}]\n"
+                        f"\n[Image attached at: {path}]\n[The user sent an image~ Here's what I can see:\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "
                         f"image_url: {path} ~]"
                     )
                 else:
                     enriched_parts.append(
-                        "[The user sent an image but I couldn't quite see it "
+                        f"\n[Image attached at: {path}]\n[The user sent an image but I couldn't quite see it "
                         "this time (>_<) You can try looking at it yourself "
                         f"with vision_analyze using image_url: {path}]"
                     )
             except Exception as e:
                 logger.error("Vision auto-analysis error: %s", e)
                 enriched_parts.append(
-                    f"[The user sent an image but something went wrong when I "
+                    f"\n[Image attached at: {path}]\n[The user sent an image but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
                     f"with vision_analyze using image_url: {path}]"
                 )

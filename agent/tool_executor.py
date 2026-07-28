@@ -32,6 +32,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.tool_result_classification import FILE_MUTATING_TOOL_NAMES
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -140,8 +141,8 @@ def _flush_session_db_after_tool_progress(
     messages: list,
     *,
     stage: str,
-) -> bool:
-    """Flush tool-call progress before projecting it to any UI surface.
+) -> None:
+    """Best-effort incremental SessionDB flush for tool-call progress.
 
     Tool execution can perform side effects that terminate or restart the
     current Hermes process before the normal turn-end persistence path runs.
@@ -149,14 +150,9 @@ def _flush_session_db_after_tool_progress(
     transcript survives destructive-but-valid tool calls.
     """
     try:
-        persisted = agent._flush_messages_to_session_db(messages) is not False
-        if not persisted:
-            agent._incremental_persistence_failed = True
-        return persisted
+        agent._flush_messages_to_session_db(messages)
     except Exception as exc:
-        agent._incremental_persistence_failed = True
         logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
-        return False
 
 
 def _ra():
@@ -385,6 +381,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
         return
 
+    # Defensive barrier for direct/internal callers that bypass the batch
+    # planner. Middleware can rewrite distinct model paths to one target, so a
+    # structured mutation must never enter this thread pool.
+    if any(tc.function.name in FILE_MUTATING_TOOL_NAMES for tc in tool_calls):
+        return execute_tool_calls_sequential(
+            agent,
+            assistant_message,
+            messages,
+            effective_task_id,
+            api_call_count,
+            finalize=finalize,
+        )
+
     # ── Parse args + pre-execution bookkeeping ───────────────────────
     parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail)
     for tool_call in tool_calls:
@@ -436,15 +445,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
-                        # Probe-validate before unwrapping (ironclaw#5149):
-                        # missing required args return the parameter schema
-                        # instead of dispatching into an opaque failure.
-                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
-                        if _probe_err is not None:
-                            _ts_scope_block = _probe_err
-                        else:
-                            function_name = _underlying
-                            function_args = _underlying_args
+                        function_name = _underlying
+                        function_args = _underlying_args
                     else:
                         _ts_scope_block = json.dumps({
                             "error": (
@@ -597,9 +599,49 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
+    # Capture failed file targets in the worker as soon as the tool returns.
+    # Post-batch bookkeeping can be delayed by slower sibling tools, during
+    # which an external recovery may already change the file.
+    mutation_failure_snapshots = [None] * num_tools
+    mutation_pre_snapshots = [None] * num_tools
+    mutation_execution_arg_holders = [{} for _ in range(num_tools)]
+    mutation_completion_order = [None] * num_tools
+    mutation_completion_lock = threading.Lock()
+    next_mutation_completion = [0]
+    turn_generation = getattr(agent, "_file_mutation_turn_generation", None)
+
+    def _mark_mutation_completion(index: int) -> None:
+        """Capture real worker completion order without reordering messages."""
+        with mutation_completion_lock:
+            if mutation_completion_order[index] is None:
+                mutation_completion_order[index] = next_mutation_completion[0]
+                next_mutation_completion[0] += 1
+
+    def _merge_mutation_baseline(index: int, actual_args: dict, post: Any) -> dict:
+        """Prefer a pre-batch baseline when middleware kept target args stable."""
+        merged = dict(post) if isinstance(post, dict) else {}
+        baseline = mutation_pre_snapshots[index]
+        if actual_args == parsed_calls[index][2] and isinstance(baseline, dict):
+            for path, snapshot in baseline.items():
+                if snapshot is not None:
+                    merged[path] = snapshot
+        return merged
+
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
+            continue
+        try:
+            mutation_pre_snapshots[i] = agent._snapshot_file_mutation_targets(
+                name,
+                args,
+                effective_task_id or "default",
+            )
+        except Exception as _ver_err:
+            logging.debug(
+                "file-mutation verifier pre-snapshot failed: %s",
+                _ver_err,
+            )
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
@@ -647,6 +689,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     pre_tool_block_checked=True,
                     skip_tool_request_middleware=True,
                     tool_request_middleware_trace=list(middleware_trace),
+                    observed_args_out=mutation_execution_arg_holders[index],
                 )
             except KeyboardInterrupt:
                 try:
@@ -664,6 +707,29 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
+                _mark_mutation_completion(index)
+                if getattr(agent, "_file_mutation_turn_generation", None) is turn_generation:
+                    try:
+                        mutation_args = mutation_execution_arg_holders[index].get(
+                            "args",
+                            function_args,
+                        )
+                        mutation_failure_snapshots[index] = _merge_mutation_baseline(
+                            index,
+                            mutation_args,
+                            agent._snapshot_failed_file_mutation_targets(
+                                function_name,
+                                mutation_args,
+                                result,
+                                True,
+                                task_id=effective_task_id or "default",
+                            ),
+                        )
+                    except Exception as _ver_err:
+                        logging.debug(
+                            "file-mutation verifier snapshot failed: %s",
+                            _ver_err,
+                        )
                 results[index] = (function_name, function_args, result, duration, True, False, middleware_trace)
                 return
             except Exception as tool_error:
@@ -671,6 +737,29 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            _mark_mutation_completion(index)
+            if getattr(agent, "_file_mutation_turn_generation", None) is turn_generation:
+                try:
+                    mutation_args = mutation_execution_arg_holders[index].get(
+                        "args",
+                        function_args,
+                    )
+                    mutation_failure_snapshots[index] = _merge_mutation_baseline(
+                        index,
+                        mutation_args,
+                        agent._snapshot_failed_file_mutation_targets(
+                            function_name,
+                            mutation_args,
+                            result,
+                            is_error,
+                            task_id=effective_task_id or "default",
+                        ),
+                    )
+                except Exception as _ver_err:
+                    logging.debug(
+                        "file-mutation verifier snapshot failed: %s",
+                        _ver_err,
+                    )
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
@@ -706,6 +795,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         futures = []
         future_to_index = {}
         timed_out_indices: set[int] = set()
+        cancelled_before_start_indices: set[int] = set()
         timeout_s = _resolve_concurrent_tool_timeout()
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         if runnable_calls:
@@ -749,7 +839,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                     result,
                                     0.0,
                                     True,
-                                    False,
+                                    True,
                                     middleware_trace,
                                 )
                         break
@@ -790,6 +880,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             for f in not_done
                             if f in future_to_index
                         }
+                        for future in not_done:
+                            if future.cancel():
+                                index = future_to_index.get(future)
+                                if index is not None:
+                                    cancelled_before_start_indices.add(index)
+                                    timed_out_indices.discard(index)
                         _still_running = [
                             parsed_calls[i][1]
                             for i in timed_out_indices
@@ -801,8 +897,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             len(timed_out_indices),
                             ", ".join(_still_running[:5]),
                         )
-                        for f in not_done:
-                            f.cancel()
                         with agent._tool_worker_threads_lock:
                             worker_tids = list(agent._tool_worker_threads)
                         for tid in worker_tids:
@@ -826,8 +920,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 f"{len(not_done)} pending concurrent tool(s)",
                                 force=True,
                             )
-                        for f in not_done:
-                            f.cancel()
+                        for future in not_done:
+                            if future.cancel():
+                                index = future_to_index.get(future)
+                                if index is not None:
+                                    cancelled_before_start_indices.add(index)
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
                         concurrent.futures.wait(not_done, timeout=3.0)
@@ -862,18 +959,146 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             total_dur = sum(r[3] for r in results if r is not None)
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
+    # Freeze one coherent post-time view. A timed-out daemon worker may finish
+    # after this point; treating that slot as unknown is safer than letting
+    # display timing decide whether its late result updates verifier state.
+    post_results = list(results)
+
+    # Replay real file outcomes in worker completion order before any display,
+    # persistence, or callback code can fail. Middleware may rewrite nominally
+    # independent calls onto the same target after the parallelism planner has
+    # run, so submission order is not a safe mutation-ledger order.
+    mutation_records = []
+    for i, (_tc, name, args, _trace, _block_result, _blocked_by_guardrail) in enumerate(parsed_calls):
+        r = post_results[i]
+        if r is None:
+            if i in cancelled_before_start_indices:
+                continue
+            mutation_args = mutation_execution_arg_holders[i].get("args", args)
+            if i in timed_out_indices:
+                suffix = (
+                    f"{timeout_s:.1f}s"
+                    if timeout_s is not None
+                    else "the configured timeout"
+                )
+                function_result = (
+                    f"Error executing tool '{name}': timed out after {suffix}"
+                )
+            elif agent._interrupt_requested:
+                function_result = (
+                    f"[Tool execution cancelled — {name} was skipped due to "
+                    "user interrupt]"
+                )
+            else:
+                function_result = (
+                    f"Error executing tool '{name}': thread did not return a result"
+                )
+            mutation_records.append((
+                mutation_completion_order[i],
+                i,
+                name,
+                mutation_args,
+                function_result,
+                True,
+                mutation_failure_snapshots[i],
+            ))
+            continue
+        (
+            function_name,
+            function_args,
+            function_result,
+            _tool_duration,
+            is_error,
+            blocked,
+            _middleware_trace,
+        ) = r
+        if not blocked:
+            observed_dispatch = mutation_execution_arg_holders[i]
+            mutation_args = observed_dispatch.get(
+                "args",
+                function_args,
+            )
+            if "result" in observed_dispatch:
+                mutation_result = observed_dispatch["result"]
+                mutation_is_error, _ = _detect_tool_failure(
+                    function_name,
+                    mutation_result,
+                )
+            else:
+                mutation_result = json.dumps({
+                    "error": "File mutation dispatch was not observed; outcome is unknown."
+                })
+                mutation_is_error = True
+            mutation_records.append((
+                mutation_completion_order[i],
+                i,
+                function_name,
+                mutation_args,
+                mutation_result,
+                mutation_is_error,
+                mutation_failure_snapshots[i],
+            ))
+
+    mutation_records.sort(
+        key=lambda record: (
+            record[0] is None,
+            record[0] if record[0] is not None else record[1],
+        ),
+    )
+    for (
+        _completion_order,
+        _submission_order,
+        function_name,
+        function_args,
+        function_result,
+        is_error,
+        failure_snapshots,
+    ) in mutation_records:
+        try:
+            agent._record_file_mutation_result(
+                function_name,
+                function_args,
+                function_result,
+                is_error,
+                task_id=effective_task_id or "default",
+                failure_snapshots=failure_snapshots,
+            )
+        except Exception as _ver_err:
+            logging.debug("file-mutation verifier record failed: %s", _ver_err)
+
     # ── Post-execution: display per-tool results ─────────────────────
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
-        r = results[i]
+        r = post_results[i]
         blocked = False
+        function_name = name
+        function_args = args
         is_error = True
-        progress_function_name = name
         # A worker can finish and write results[i] in the window between the
         # deadline snapshot (timed_out_indices, taken from not_done) and this
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
-        if i in timed_out_indices and r is None:
+        if i in cancelled_before_start_indices and r is None:
+            blocked = True
+            effect_disposition = "none"
+            reason = "the batch timed out" if not agent._interrupt_requested else "the batch was interrupted"
+            function_result = (
+                f"[Tool execution skipped — {name} was not started before {reason}]"
+            )
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=name,
+                function_args=args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tc, "id", "") or "",
+                status="cancelled",
+                error_type="tool_not_started",
+                error_message=function_result,
+                middleware_trace=list(middleware_trace),
+            )
+            tool_duration = 0.0
+        elif i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
@@ -923,7 +1148,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = 0.0
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
-            progress_function_name = function_name
             if blocked:
                 effect_disposition = "none"
 
@@ -940,26 +1164,44 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
-            # Track file-mutation outcome for the turn-end verifier.
-            # `blocked` calls never actually ran — don't let a guardrail
-            # block count as either a failure or a success.
-            if not blocked:
-                try:
-                    agent._record_file_mutation_result(
-                        function_name, function_args, function_result, is_error,
-                    )
-                except Exception as _ver_err:
-                    logging.debug("file-mutation verifier record failed: %s", _ver_err)
-
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+
+        if not blocked and agent.tool_progress_callback:
+            try:
+                agent.tool_progress_callback(
+                    "tool.completed", function_name, None, None,
+                    duration=tool_duration, is_error=is_error,
+                    result=function_result,
+                )
+            except Exception as cb_err:
+                logging.debug(f"Tool progress callback error: {cb_err}")
+
+        # Print cute message per tool
+        if agent._should_emit_quiet_tool_messages():
+            cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
+            agent._safe_print(f"  {cute_msg}")
+        elif not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+            _preview_str = _multimodal_text_summary(function_result)
+            if agent.verbose_logging:
+                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
+                print(agent._wrap_verbose("Result: ", _preview_str))
+            else:
+                response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
+                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
         agent._current_tool = None
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
-        display_function_result = function_result
+        if not blocked and agent.tool_complete_callback:
+            try:
+                display_args = _redact_tool_args_for_display(name, args) or args
+                agent.tool_complete_callback(tc.id, name, display_args, function_result)
+            except Exception as cb_err:
+                logging.debug(f"Tool complete callback error: {cb_err}")
+
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -994,50 +1236,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
-        if not _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"tool result {name}",
-        ):
-            return
-
-        # Every completion surface is downstream of the canonical append. If
-        # the UI bridge or process dies while projecting one of these events,
-        # resume can reconstruct the tool result that was already visible.
-        if not blocked and agent.tool_progress_callback:
-            try:
-                agent.tool_progress_callback(
-                    "tool.completed", progress_function_name, None, None,
-                    duration=tool_duration, is_error=is_error,
-                    result=display_function_result,
-                )
-            except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
-
-        # Print cute message per tool
-        if agent._should_emit_quiet_tool_messages():
-            cute_msg = _get_cute_tool_message_impl(
-                name, args, tool_duration, result=display_function_result,
-            )
-            agent._safe_print(f"  {cute_msg}")
-        elif not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
-            _preview_str = _multimodal_text_summary(display_function_result)
-            if agent.verbose_logging:
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
-                print(agent._wrap_verbose("Result: ", _preview_str))
-            else:
-                response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
-
-        if not blocked and agent.tool_complete_callback:
-            try:
-                display_args = _redact_tool_args_for_display(name, args) or args
-                agent.tool_complete_callback(
-                    tc.id, name, display_args, display_function_result,
-                )
-            except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
-
         if (
             risk_metadata is not None
             and risk_metadata.get("risk") != "low"
@@ -1054,6 +1252,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool output risk callback error: %s", cb_err)
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"tool result {name}",
+        )
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Same as the sequential path: drain between each collected
@@ -1085,8 +1288,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
-        if getattr(agent, "_incremental_persistence_failed", False):
-            return
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -1102,12 +1303,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
-                if not _flush_session_db_after_tool_progress(
+                _flush_session_db_after_tool_progress(
                     agent,
                     messages,
                     stage=f"cancelled tool result {skipped_name}",
-                ):
-                    return
+                )
             break
 
         function_name = tool_call.function.name
@@ -1123,12 +1323,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call.id,
                 )
             )
-            if not _flush_session_db_after_tool_progress(
+            _flush_session_db_after_tool_progress(
                 agent,
                 messages,
                 stage=f"invalid tool arguments {function_name}",
-            ):
-                return
+            )
             agent._apply_pending_steer_to_tool_results(messages, 1)
             continue
 
@@ -1142,25 +1341,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
                     if _underlying in _tool_search_scoped_names(agent):
-                        # Probe-validate before unwrapping (ironclaw#5149):
-                        # missing required args return the parameter schema
-                        # instead of dispatching into an opaque failure.
-                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
-                        if _probe_err is not None:
-                            # This path wraps _block_msg in {"error": ...} —
-                            # flatten the probe payload to one plain string.
-                            try:
-                                _probe = json.loads(_probe_err)
-                                _ts_scope_block = (
-                                    f"{_probe.get('error', '')} Parameters schema: "
-                                    f"{json.dumps(_probe.get('parameters', {}), ensure_ascii=False)}. "
-                                    f"{_probe.get('hint', '')}"
-                                ).strip()
-                            except Exception:
-                                _ts_scope_block = _probe_err
-                        else:
-                            function_name = _underlying
-                            function_args = _underlying_args
+                        function_name = _underlying
+                        function_args = _underlying_args
                     else:
                         _ts_scope_block = (
                             f"'{_underlying}' is not available in this session. "
@@ -1281,6 +1463,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        observed_dispatch: Dict[str, Any] = {}
+        mutation_failure_snapshots: Dict[str, Any] = {}
+
+        def _capture_mutation_baseline(dispatch_args: Dict[str, Any]) -> None:
+            nonlocal mutation_failure_snapshots
+            mutation_failure_snapshots = agent._snapshot_file_mutation_targets(
+                function_name,
+                dispatch_args,
+                effective_task_id or "default",
+            )
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
@@ -1406,7 +1598,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return _clarify_tool(
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
-                    multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
                 )
             function_result, function_args = _run_agent_tool_execution_middleware(
@@ -1567,6 +1758,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    observed_dispatch_out=observed_dispatch,
+                    before_dispatch=_capture_mutation_baseline,
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1609,6 +1802,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    observed_dispatch_out=observed_dispatch,
+                    before_dispatch=_capture_mutation_baseline,
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
@@ -1686,11 +1881,38 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # turn, not just the parallel ones.
         if not _execution_blocked:
             try:
+                mutation_args = observed_dispatch.get("args", function_args)
+                if "result" in observed_dispatch:
+                    mutation_result = observed_dispatch["result"]
+                    mutation_is_error, _ = _detect_tool_failure(
+                        function_name,
+                        mutation_result,
+                    )
+                else:
+                    mutation_result = json.dumps({
+                        "error": "File mutation dispatch was not observed; outcome is unknown."
+                    })
+                    mutation_is_error = True
                 agent._record_file_mutation_result(
-                    function_name, function_args, function_result, _is_error_result,
+                    function_name,
+                    mutation_args,
+                    mutation_result,
+                    mutation_is_error,
+                    task_id=effective_task_id or "default",
+                    failure_snapshots=mutation_failure_snapshots,
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
+
+        if not _execution_blocked and agent.tool_progress_callback:
+            try:
+                agent.tool_progress_callback(
+                    "tool.completed", function_name, None, None,
+                    duration=tool_duration, is_error=_is_error_result,
+                    result=function_result,
+                )
+            except Exception as cb_err:
+                logging.debug(f"Tool progress callback error: {cb_err}")
 
         agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""
@@ -1701,7 +1923,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _log_result = _multimodal_text_summary(function_result)
             logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
 
-        display_function_result = function_result
+        if not _execution_blocked and agent.tool_complete_callback:
+            try:
+                display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
+                agent.tool_complete_callback(tool_call.id, function_name, display_args, function_result)
+            except Exception as cb_err:
+                logging.debug(f"Tool complete callback error: {cb_err}")
+
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
@@ -1724,40 +1952,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
-        if not _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"tool result {function_name}",
-        ):
-            return
-
-        # UI completion/progress events are projections of the canonical tool
-        # row, never a competing in-memory authority.
-        if not _execution_blocked and agent.tool_progress_callback:
-            try:
-                agent.tool_progress_callback(
-                    "tool.completed", function_name, None, None,
-                    duration=tool_duration, is_error=_is_error_result,
-                    result=display_function_result,
-                )
-            except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
-
-        if not _execution_blocked and agent.tool_complete_callback:
-            try:
-                display_args = (
-                    _redact_tool_args_for_display(function_name, function_args)
-                    or function_args
-                )
-                agent.tool_complete_callback(
-                    tool_call.id,
-                    function_name,
-                    display_args,
-                    display_function_result,
-                )
-            except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
-
         if (
             risk_metadata is not None
             and risk_metadata.get("risk") != "low"
@@ -1774,6 +1968,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool output risk callback error: %s", cb_err)
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"tool result {function_name}",
+        )
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Drain pending steer BETWEEN individual tool calls so the
@@ -1801,12 +2000,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
-                if not _flush_session_db_after_tool_progress(
+                _flush_session_db_after_tool_progress(
                     agent,
                     messages,
                     stage=f"skipped tool result {skipped_name}",
-                ):
-                    return
+                )
             break
 
         if agent.tool_delay > 0 and i < len(assistant_message.tool_calls):
@@ -1857,8 +2055,6 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
     for kind, calls in segments:
-        if getattr(agent, "_incremental_persistence_failed", False):
-            return
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -1870,9 +2066,6 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
             )
-
-        if getattr(agent, "_incremental_persistence_failed", False):
-            return
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)

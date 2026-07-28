@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// set-exe-identity.mjs — stamp the Hermes icon + version metadata onto the
-// built Hermes.exe using rcedit, completely decoupled from electron-builder's
+// set-exe-identity.mjs — stamp the product icon + version metadata onto the
+// built executable using rcedit, completely decoupled from electron-builder's
 // signing path.
 //
 // WHY THIS EXISTS
@@ -42,6 +42,23 @@ import { rcedit } from 'rcedit'
 
 import { isMain } from './utils.mjs'
 
+function resolveProductIdentity(env = process.env) {
+  const configuredName =
+    'HERMES_DESKTOP_APP_NAME' in env ? env.HERMES_DESKTOP_APP_NAME : env.KUMO_DESKTOP_APP_NAME
+  const productName = configuredName?.trim() || 'Hermes'
+  const isChandra = productName.toLowerCase() === 'chandra'
+  const companyName =
+    env.HERMES_DESKTOP_COMPANY_NAME?.trim() ||
+    env.KUMO_DESKTOP_COMPANY_NAME?.trim() ||
+    (isChandra ? 'Kumobits' : 'Nous Research')
+  const legalCopyright =
+    env.HERMES_DESKTOP_LEGAL_COPYRIGHT?.trim() ||
+    env.KUMO_DESKTOP_LEGAL_COPYRIGHT?.trim() ||
+    `Copyright (c) 2026 ${companyName}`
+
+  return { companyName, legalCopyright, productName }
+}
+
 // Stamp the Hermes icon + identity onto `exe`. Resolves on success, throws on
 // failure. `desktopRoot` defaults to this script's package root so the icon and
 // the rcedit dependency resolve regardless of cwd.
@@ -59,20 +76,22 @@ async function stampExeIdentity(exe, desktopRoot = resolve(import.meta.dirname, 
   console.log(`[set-exe-identity] stamping ${exe}`)
   console.log(`[set-exe-identity] icon: ${icon}`)
 
+  const { companyName, legalCopyright, productName } = resolveProductIdentity()
+
   await rcedit(exe, {
     icon,
     'version-string': {
-      ProductName: 'Hermes',
-      FileDescription: 'Hermes',
-      CompanyName: 'Nous Research',
-      LegalCopyright: 'Copyright (c) 2026 Nous Research'
+      ProductName: productName,
+      FileDescription: productName,
+      CompanyName: companyName,
+      LegalCopyright: legalCopyright
     }
   })
 
-  console.log('[set-exe-identity] done — Hermes icon + identity stamped')
+  console.log(`[set-exe-identity] done — ${productName} icon + identity stamped`)
 }
 
-export { stampExeIdentity }
+export { resolveProductIdentity, stampExeIdentity }
 
 // CLI entry point: `node scripts/set-exe-identity.mjs <exe>`.
 if (isMain(import.meta.url)) {

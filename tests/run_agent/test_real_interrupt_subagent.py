@@ -127,7 +127,13 @@ class TestRealSubagentInterrupt(unittest.TestCase):
                             child_started.set()
                             return original_run(self_agent, *args, **kwargs)
 
-                        with patch.object(AIAgent, 'run_conversation', patched_run):
+                        with (
+                            patch.object(AIAgent, 'run_conversation', patched_run),
+                            patch(
+                                'agent.context_compressor.get_model_context_length',
+                                return_value=256_000,
+                            ),
+                        ):
                             # Build a real child agent (AIAgent is NOT patched here,
                             # only run_conversation and _build_system_prompt are)
                             child = AIAgent(

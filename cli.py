@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 import logging
 import copy
 import os
+import posixpath
 import shutil
 import sys
 import json
@@ -446,6 +447,7 @@ def load_cli_config() -> Dict[str, Any]:
         "terminal": {
             "env_type": "local",
             "cwd": ".",  # "." is resolved to os.getcwd() at runtime
+            "inactivity_timeout": 0,
             "home_mode": "auto",
             "lifetime_seconds": 300,
             "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
@@ -659,6 +661,7 @@ def load_cli_config() -> Dict[str, Any]:
         "env_type": "TERMINAL_ENV",
         "cwd": "TERMINAL_CWD",
         "timeout": "TERMINAL_TIMEOUT",
+        "inactivity_timeout": "TERMINAL_INACTIVITY_TIMEOUT",
         "home_mode": "TERMINAL_HOME_MODE",
         "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
         "docker_image": "TERMINAL_DOCKER_IMAGE",
@@ -3163,8 +3166,8 @@ def _termux_example_image_path(filename: str = "cat.png") -> str:
     ]
     for root in candidates:
         if os.path.isdir(root):
-            return os.path.join(root, "Pictures", filename)
-    return os.path.join("~/storage/shared", "Pictures", filename)
+            return posixpath.join(root, "Pictures", filename)
+    return posixpath.join("~/storage/shared", "Pictures", filename)
 
 
 def _split_path_input(raw: str) -> tuple[str, str]:
@@ -7213,6 +7216,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _cprint(f"  {_DIM}✓ image analyzed{_RST}")
                 else:
                     enriched_parts.append(
+                        f"\n[Image attached at: {img_path}]\n"
                         f"[The user attached an image but it couldn't be analyzed. "
                         f"You can try examining it with vision_analyze using "
                         f"image_url: {img_path}]"
@@ -7221,6 +7225,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _cprint(f"  {_DIM}⚠ vision analysis failed — path included for retry{_RST}")
             except Exception as e:
                 enriched_parts.append(
+                    f"\n[Image attached at: {img_path}]\n"
                     f"[The user attached an image but analysis failed ({e}). "
                     f"You can try examining it with vision_analyze using "
                     f"image_url: {img_path}]"
@@ -8892,7 +8897,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if persist_global:
             HermesCLI._clear_persisted_context_for_model_switch(self, result)
             save_config_value("model.default", result.new_model)
-            save_config_value("model.provider", result.target_provider)
+            if result.provider_changed:
+                save_config_value("model.provider", result.target_provider)
             # base_url/api_mode were previously never persisted here, so a
             # global switch left the OLD provider's endpoint/wire-protocol in
             # config.yaml. result.base_url/api_mode are always freshly
@@ -9246,7 +9252,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if persist_global:
             HermesCLI._clear_persisted_context_for_model_switch(self, result)
             save_config_value("model.default", result.new_model)
-            save_config_value("model.provider", result.target_provider)
+            if result.provider_changed:
+                save_config_value("model.provider", result.target_provider)
             # See _apply_model_switch_result above for why base_url/api_mode
             # must be synced on every global switch (#25106).
             save_config_value("model.base_url", result.base_url or None)
@@ -14427,9 +14434,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                              f"agent_running={self._agent_running}\n")
                             except Exception:
                                 pass
-                    # First-touch onboarding: on the very first busy-while-running
-                    # event for this install, print a one-line tip explaining the
-                    # /busy knob.  Flag persists to config.yaml and never fires
                     # again.  Guarded for exceptions so onboarding can't break
                     # the input loop.
                     try:

@@ -3,6 +3,8 @@ import './styles.css'
 import './store/active-work'
 // Side-effect: applies the persisted window translucency on load.
 import './store/translucency'
+// Applies Chandra theme defaults before themes/context reads storage.
+import './lib/chandra-bootstrap-init'
 // Dev-only render/state churn counters. MUST precede the `react-dom` import
 // below: react-dom captures the devtools hook at module init, so bippy has to
 // install during THIS import's evaluation or every commit goes unseen

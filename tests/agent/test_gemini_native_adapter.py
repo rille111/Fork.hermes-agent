@@ -89,6 +89,41 @@ def test_build_native_request_emits_sentinel_for_cross_provider_tool_call():
     assert parts[0]["thoughtSignature"] == "skip_thought_signature_validator"
 
 
+def test_followup_user_turn_is_not_merged_into_function_response_turn():
+    from agent.gemini_native_adapter import _build_gemini_contents
+
+    messages = [
+        {"role": "user", "content": "Load the skill"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": '{"name":"hermes-agent"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "loaded"},
+        {"role": "user", "content": "Continue"},
+    ]
+
+    contents, _ = _build_gemini_contents(messages)
+
+    assert [content["role"] for content in contents] == [
+        "user",
+        "model",
+        "user",
+        "user",
+    ]
+    assert "functionResponse" in contents[-2]["parts"][0]
+    assert contents[-1]["parts"] == [{"text": "Continue"}]
+
+
 def test_build_native_request_uses_original_function_name_for_tool_result():
     from agent.gemini_native_adapter import build_gemini_request
 
@@ -491,6 +526,21 @@ def test_max_tokens_none_defaults_to_gemini_output_ceiling():
 
     req = build_gemini_request(messages=[{"role": "user", "content": "hi"}], max_tokens=None)
     assert req["generationConfig"]["maxOutputTokens"] == GEMINI_DEFAULT_MAX_OUTPUT_TOKENS == 65535
+
+
+def test_max_tokens_none_uses_gemma_output_ceiling():
+    from agent.gemini_native_adapter import (
+        build_gemini_request,
+        GEMMA_DEFAULT_MAX_OUTPUT_TOKENS,
+    )
+
+    req = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=None,
+        model="gemma-3-27b-it",
+    )
+
+    assert req["generationConfig"]["maxOutputTokens"] == GEMMA_DEFAULT_MAX_OUTPUT_TOKENS == 8192
 
 
 def test_explicit_max_tokens_is_respected():

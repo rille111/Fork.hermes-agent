@@ -241,6 +241,7 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
 
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
+    agent._turn_file_mutation_snapshot_budget = {"remaining": 0}
     _build(agent)
     # Retry counters reset, guardrails reset, vision re-armed, turn counted.
     assert agent._invalid_tool_retries == 0
@@ -252,6 +253,7 @@ def test_applies_agent_side_effects():
     # task/turn ids assigned on the agent.
     assert agent._current_task_id
     assert agent._current_turn_id
+    assert agent._turn_file_mutation_snapshot_budget is None
 
 
 def test_task_id_passthrough():

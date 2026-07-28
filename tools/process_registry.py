@@ -41,7 +41,12 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell,
+    _resolve_safe_cwd,
+    _sanitize_subprocess_env,
+    _sanitize_msys_nul_redirection,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -705,6 +710,9 @@ class ProcessRegistry:
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
         """
+        if _IS_WINDOWS and command:
+            command = _sanitize_msys_nul_redirection(command)
+
         # Guard against the `A && B &` subshell-wait trap (issue #68915).
         # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds
         # the stdout pipe open forever when B is a long-running server.

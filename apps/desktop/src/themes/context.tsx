@@ -165,13 +165,22 @@ const NEUTRAL_CHROME = { light: '#f3f3f3', dark: '#0d0d0e' } as const
 const chromeBackground = (background: string, isDark: boolean) =>
   mix(background, NEUTRAL_CHROME[isDark ? 'dark' : 'light'], isDark ? 0.26 : 0.08)
 
-const mixesFor = (isDark: boolean): Record<string, string> => ({
-  '--theme-mix-chrome': isDark ? '74%' : '92%',
-  '--theme-mix-sidebar': '100%',
-  '--theme-mix-card': isDark ? '38%' : '22%',
-  '--theme-mix-elevated': isDark ? '46%' : '28%',
-  '--theme-mix-bubble': isDark ? '46%' : '0%'
-})
+const mixesFor = (isDark: boolean, skinName: string): Record<string, string> =>
+  skinName === 'chandra'
+    ? {
+        '--theme-mix-chrome': '100%',
+        '--theme-mix-sidebar': '100%',
+        '--theme-mix-card': '100%',
+        '--theme-mix-elevated': '100%',
+        '--theme-mix-bubble': '100%'
+      }
+    : {
+        '--theme-mix-chrome': isDark ? '74%' : '92%',
+        '--theme-mix-sidebar': '100%',
+        '--theme-mix-card': isDark ? '38%' : '22%',
+        '--theme-mix-elevated': isDark ? '46%' : '28%',
+        '--theme-mix-bubble': isDark ? '46%' : '0%'
+      }
 
 function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark') {
   if (typeof document === 'undefined') {
@@ -226,7 +235,7 @@ function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark') {
     '--noise-opacity-mul': isDark ? 'calc(0.04 / 0.21)' : 'calc(0.34 / 0.21)'
   }
 
-  for (const [k, v] of Object.entries({ ...seeds, ...mixesFor(isDark), ...palette })) {
+  for (const [k, v] of Object.entries({ ...seeds, ...mixesFor(isDark, skinName), ...palette })) {
     root.style.setProperty(k, v)
   }
 

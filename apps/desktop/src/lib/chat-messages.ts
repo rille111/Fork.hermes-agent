@@ -1,7 +1,7 @@
 import type { ThreadMessageLike } from '@assistant-ui/react'
 import { type BillingBlock, skillInvocationText } from '@hermes/shared'
 
-import { extractImageRefs } from '@/lib/embedded-images'
+import { extractImageRefs, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
 import { mediaDisplayLabel, mediaMarkdownHref } from '@/lib/media'
 import { normalize } from '@/lib/text'
@@ -122,9 +122,10 @@ export function reasoningPart(text: string): ChatMessagePart {
   return { type: 'reasoning', text }
 }
 
-const MEDIA_LINE_RE = /(^|\n)[\t ]*[`"']?MEDIA:\s*(?<line>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?[\t ]*(\n|$)/g
+const MEDIA_LINE_RE =
+  /(^|\n)[\t ]*[`"']?MEDIA:[\t ]*(?<line>`[^`\r\n]+`|"[^"\r\n]+"|'[^'\r\n]+'|[^\r\n]*?\S)[`"']?[\t ]*(?=\r?\n|$)/g
 
-const MEDIA_TAG_RE = /[`"']?MEDIA:\s*(?<inline>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?/g
+const MEDIA_TAG_RE = /[`"']?MEDIA:[\t ]*(?<inline>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?/g
 
 function unquoteMediaPath(value: string): string {
   const trimmed = value.trim()
@@ -141,10 +142,7 @@ function mediaLink(value: string): string {
 
 export function renderMediaTags(text: string): string {
   return text
-    .replace(
-      MEDIA_LINE_RE,
-      (_match, lead: string, value: string, trailer: string) => `${lead}${mediaLink(value)}${trailer}`
-    )
+    .replace(MEDIA_LINE_RE, (_match, lead: string, value: string) => `${lead}${mediaLink(value)}`)
     .replace(MEDIA_TAG_RE, (_match, value: string) => mediaLink(value))
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
@@ -257,6 +255,23 @@ export function mergeFinalAssistantText(parts: ChatMessagePart[], finalText: str
 const ATTACHED_CONTEXT_MARKER_RE = /(?:^|\n)--- Attached Context ---\s*\n/
 const CONTEXT_WARNINGS_MARKER_RE = /(?:^|\n)--- Context Warnings ---[\s\S]*$/
 const CONTEXT_REF_RE = /@(file|folder|url|image|tool|terminal):(?:"[^"\n]+"|'[^'\n]+'|`[^`\n]+`|\S+)/g
+const USER_CONTEXT_TAIL_RE = /(?:^|\n)--- (?:Attached Context|Context Warnings) ---[\s\S]*$/i
+const USER_SCREENSHOT_TAIL_RE = /(?:\s*\[screenshot\]\s*)+$/i
+
+/** Reduce local, projected, and persisted forms of one user turn to its visible prompt. */
+export function comparableUserMessageText(text: string): string {
+  return textWithoutEmbeddedImages(text)
+    .replaceAll(String.fromCharCode(13), '')
+    .replace(USER_CONTEXT_TAIL_RE, '')
+    .replace(/\n?\[Image attached(?: at)?:[\s\S]*?\]/gi, '')
+    .replace(/\n?\[IMAGE:[\s\S]*?\]/gi, '')
+    .replace(/\n?@image:[^\s]+/gi, '')
+    .replace(/\n?@file:[^\s]+/gi, '')
+    .replace(/\n?\[The user (?:sent|attached) an image[\s\S]*?\]/gi, '')
+    .replace(/\n?\[(?:If you need a closer look|You can examine it)[\s\S]*?\]/gi, '')
+    .replace(USER_SCREENSHOT_TAIL_RE, '')
+    .trim()
+}
 
 function textFromUnknown(value: unknown, depth = 0): string {
   if (typeof value === 'string') {
@@ -1092,50 +1107,86 @@ export function preserveLocalAssistantErrors(
   })
 
   const existingIds = new Set(mergedNextMessages.map(message => message.id))
-  const preserveIds = new Set<string>()
-  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim()
-  const tailUserInNext = [...mergedNextMessages].reverse().find(message => message.role === 'user' && !message.hidden)
-  const tailUserText = tailUserInNext ? normalize(chatMessageText(tailUserInNext)) : ''
-  const tailUserRefs = tailUserInNext ? (tailUserInNext.attachmentRefs ?? []).join('\n') : ''
+  const normalize = (value: string) => comparableUserMessageText(value).replace(/\s+/g, ' ')
 
-  const matchesTailUserInNext = (candidate: ChatMessage) =>
-    Boolean(tailUserInNext) &&
-    normalize(chatMessageText(candidate)) === tailUserText &&
-    (candidate.attachmentRefs ?? []).join('\n') === tailUserRefs
+  const currentUsers = currentMessages
+    .map((message, index) => ({ index, message }))
+    .filter(({ message }) => message.role === 'user' && !message.hidden)
+
+  const authoritativeUsers = mergedNextMessages.filter(message => message.role === 'user' && !message.hidden)
+
+  const errorsToPreserve: Array<{
+    matchedUserId?: string
+    message: ChatMessage
+    precedingUser: ChatMessage | null
+    userFromTail: number
+  }> = []
 
   for (let index = 0; index < currentMessages.length; index += 1) {
     const message = currentMessages[index]
 
-    if (message.role !== 'assistant' || !message.error || message.hidden || existingIds.has(message.id)) {
-      continue
-    }
+    if (message.role === 'assistant' && message.error && !message.hidden && !existingIds.has(message.id)) {
+      const precedingUserOrdinal = currentUsers.findLastIndex(user => user.index < index)
+      const precedingUser = precedingUserOrdinal >= 0 ? currentUsers[precedingUserOrdinal].message : null
 
-    preserveIds.add(message.id)
-
-    for (let probe = index - 1; probe >= 0; probe -= 1) {
-      const candidate = currentMessages[probe]
-
-      if (candidate.hidden) {
-        continue
-      }
-
-      if (candidate.role === 'user' && !existingIds.has(candidate.id) && !matchesTailUserInNext(candidate)) {
-        preserveIds.add(candidate.id)
-      }
-
-      break
+      errorsToPreserve.push({
+        message: { ...message, pending: false },
+        precedingUser,
+        userFromTail: precedingUserOrdinal >= 0 ? currentUsers.length - precedingUserOrdinal - 1 : -1
+      })
     }
   }
 
-  if (preserveIds.size === 0) {
+  if (errorsToPreserve.length === 0) {
     return mergedNextMessages
   }
 
-  const preserved = currentMessages
-    .filter(message => preserveIds.has(message.id))
-    .map(message => ({ ...message, pending: false }))
+  // Align from the transcript tail, not by the first matching text. A repeated
+  // prompt must not move the newest local error underneath an older equal turn.
+  for (const localError of errorsToPreserve) {
+    if (!localError.precedingUser || localError.userFromTail < 0) {
+      continue
+    }
 
-  return [...mergedNextMessages, ...preserved]
+    const candidate = authoritativeUsers.at(-(localError.userFromTail + 1))
+
+    if (
+      candidate &&
+      normalize(chatMessageText(candidate)) === normalize(chatMessageText(localError.precedingUser)) &&
+      (candidate.attachmentRefs ?? []).join('\n') === (localError.precedingUser.attachmentRefs ?? []).join('\n')
+    ) {
+      localError.matchedUserId = candidate.id
+    }
+  }
+
+  const result: ChatMessage[] = []
+  const consumedErrors = new Set<string>()
+
+  for (const message of mergedNextMessages) {
+    result.push(message)
+
+    if (message.role === 'user' && !message.hidden) {
+      for (const localError of errorsToPreserve) {
+        if (!consumedErrors.has(localError.message.id) && localError.matchedUserId === message.id) {
+          result.push(localError.message)
+          consumedErrors.add(localError.message.id)
+        }
+      }
+    }
+  }
+
+  for (const localError of errorsToPreserve) {
+    if (!consumedErrors.has(localError.message.id)) {
+      if (localError.precedingUser && !existingIds.has(localError.precedingUser.id)) {
+        result.push(localError.precedingUser)
+        existingIds.add(localError.precedingUser.id)
+      }
+
+      result.push(localError.message)
+    }
+  }
+
+  return result
 }
 
 export function branchGroupForUser(userMessage: ChatMessage): string {

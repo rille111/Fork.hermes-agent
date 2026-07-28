@@ -128,6 +128,7 @@ function TileChat({
       $awaitingInput: sessionAwaitingInput(runtimeId),
       $messages: view.$messages,
       attachments,
+      popoutAllowed: true,
       target: `tile:${storedSessionId}`
     }),
     [attachments, runtimeId, storedSessionId, view.$messages]

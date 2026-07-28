@@ -27,6 +27,8 @@ export interface ComposerScope {
    *  keep streaming out of the composer's renders; subscribe only off-render
    *  (auto-speak) where the reply edge is the whole point. */
   $messages: ReadableAtom<ChatMessage[]>
+  /** Whether this surface may detach from its bottom dock. */
+  popoutAllowed: boolean
   /** Focus-bus routing key (`'main'` | `'tile:<id>'`). */
   target: ComposerTarget
 }
@@ -35,6 +37,7 @@ export const MAIN_COMPOSER_SCOPE: ComposerScope = {
   $awaitingInput: $activeSessionAwaitingInput,
   $messages,
   attachments: mainComposerScope,
+  popoutAllowed: false,
   target: 'main'
 }
 

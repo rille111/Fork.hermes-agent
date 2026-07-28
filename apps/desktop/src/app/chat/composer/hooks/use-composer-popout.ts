@@ -18,6 +18,7 @@ import { isSecondaryWindow } from '@/store/windows'
 import { useComposerPopoutGestures } from './use-popout-drag'
 
 interface UseComposerPopoutOptions {
+  allowed?: boolean
   composerRef: RefObject<HTMLFormElement | null>
 }
 
@@ -120,8 +121,8 @@ function usePopoutPlacement(
  * Secondary windows (the tiny Ctrl+Shift+N window, subagent watch windows) stay
  * docked: a floating composer makes no sense in a scratch window.
  */
-export function useComposerPopout({ composerRef }: UseComposerPopoutOptions) {
-  const popoutAllowed = !isSecondaryWindow()
+export function useComposerPopout({ allowed = true, composerRef }: UseComposerPopoutOptions) {
+  const popoutAllowed = allowed && !isSecondaryWindow()
   const groupId = usePaneGroup()
   const zone = useStore(useMemo(() => $composerPopoutZone(groupId), [groupId]))
   const poppedOut = zone.poppedOut && popoutAllowed
