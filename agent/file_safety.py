@@ -177,6 +177,147 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
     return f"{verb} denied: '{path}' is a protected system/credential file."
 
 
+def get_file_verifier_block_error(path: str) -> Optional[str]:
+    """Apply read/write privacy policy without dereferencing the target.
+
+    The mutation verifier calls this before any target ``lstat`` or ``open``.
+    Symlink/reparse components are rejected separately by the verifier, so a
+    lexical policy is both sufficient and avoids touching credential targets
+    merely to decide that they are protected.
+    """
+    try:
+        def lexical(value: str | os.PathLike[str]) -> str:
+            expanded = os.path.expanduser(str(value))
+            return os.path.normcase(os.path.normpath(os.path.abspath(expanded)))
+
+        def within(candidate: str, root: str) -> bool:
+            try:
+                return os.path.commonpath((candidate, root)) == root
+            except (OSError, ValueError):
+                return False
+
+        candidate = lexical(path)
+        basename = os.path.basename(candidate).lower()
+        credential_basenames = {
+            "authorized_keys",
+            "id_rsa",
+            "id_ed25519",
+            ".netrc",
+            ".pgpass",
+            ".npmrc",
+            ".pypirc",
+            ".git-credentials",
+            "auth.json",
+            "auth.lock",
+            ".anthropic_oauth.json",
+            "google_oauth.json",
+            "bws_cache.json",
+            "bws_cache.enc.json",
+        }
+        if basename in _BLOCKED_PROJECT_ENV_BASENAMES | credential_basenames:
+            return "Verifier denied a secret-bearing environment file."
+        components = {
+            component.lower()
+            for component in candidate.replace("\\", "/").split("/")
+            if component
+        }
+        if components & {".ssh", ".aws", ".gnupg", ".kube"}:
+            return "Verifier denied a credential-bearing directory."
+
+        home = lexical("~")
+        exact = {
+            lexical(os.path.join(home, relative))
+            for relative in (
+                os.path.join(".ssh", "authorized_keys"),
+                os.path.join(".ssh", "id_rsa"),
+                os.path.join(".ssh", "id_ed25519"),
+                os.path.join(".ssh", "config"),
+                ".netrc",
+                ".pgpass",
+                ".npmrc",
+                ".pypirc",
+                ".git-credentials",
+            )
+        }
+        exact.update(lexical(value) for value in (
+            "/etc/sudoers",
+            "/etc/passwd",
+            "/etc/shadow",
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+        ))
+        if candidate in exact:
+            return "Verifier denied a protected system/credential file."
+
+        protected_roots = [
+            lexical(os.path.join(home, relative))
+            for relative in (
+                ".ssh",
+                ".aws",
+                ".gnupg",
+                ".kube",
+                ".docker",
+                ".azure",
+                os.path.join(".config", "gh"),
+                os.path.join(".config", "gcloud"),
+            )
+        ]
+        protected_roots.extend(lexical(value) for value in (
+            "/etc",
+            "/boot",
+            "/usr/lib/systemd",
+            "/private/etc",
+            "/private/var",
+        ))
+        if any(within(candidate, root) for root in protected_roots):
+            return "Verifier denied a protected system/credential directory."
+
+        credential_names = (
+            "auth.json",
+            "auth.lock",
+            ".anthropic_oauth.json",
+            ".env",
+            "webhook_subscriptions.json",
+            os.path.join("auth", "google_oauth.json"),
+            os.path.join("cache", "bws_cache.json"),
+            os.path.join("cache", "bws_cache.enc.json"),
+            "state.db",
+        )
+        for base in (_hermes_home_path(), _hermes_root_path()):
+            root = lexical(base)
+            if any(candidate == lexical(os.path.join(root, name)) for name in credential_names):
+                return "Verifier denied Hermes credential/application state."
+            for relative in (
+                "sessions",
+                "mcp-tokens",
+                "pairing",
+                os.path.join("skills", ".hub"),
+            ):
+                if within(candidate, lexical(os.path.join(root, relative))):
+                    return "Verifier denied Hermes credential/application state."
+
+        try:
+            from hermes_cli.config import get_config_path
+
+            if candidate == lexical(get_config_path()):
+                return "Verifier denied the Hermes configuration file."
+        except Exception:
+            return "Verifier could not classify the Hermes configuration path."
+
+        raw_safe_roots = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
+        if raw_safe_roots:
+            safe_roots = [
+                lexical(value)
+                for value in raw_safe_roots.split(os.pathsep)
+                if value
+            ]
+            if not any(within(candidate, root) for root in safe_roots):
+                return "Verifier target is outside HERMES_WRITE_SAFE_ROOT."
+        return None
+    except Exception:
+        return "Verifier could not safely classify the target."
+
+
 # Common secret-bearing project-local environment file basenames.
 # These are blocked because .env files routinely contain API keys,
 # database passwords, and other credentials.

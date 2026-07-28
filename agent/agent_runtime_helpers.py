@@ -2456,7 +2456,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
-                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None) -> str:
+                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+                 observed_args_out: Optional[Dict[str, Any]] = None) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -2614,7 +2615,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 _clarify_tool(
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
-                    multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
                 ),
                 next_args,
@@ -2635,26 +2635,40 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     else:
         def _execute(next_args: dict) -> Any:
+            dispatch_kwargs = {
+                "tool_call_id": tool_call_id,
+                "session_id": agent.session_id or "",
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+                "enabled_tools": list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                "skip_pre_tool_call_hook": True,
+                "skip_tool_request_middleware": True,
+                "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
+                "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
+                "tool_request_middleware_trace": list(_tool_middleware_trace),
+            }
+            if isinstance(observed_args_out, dict):
+                dispatch_kwargs["observed_dispatch_out"] = observed_args_out
             return _ra().handle_function_call(
                 function_name, next_args, effective_task_id,
-                tool_call_id=tool_call_id,
-                session_id=agent.session_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                skip_pre_tool_call_hook=True,
-                skip_tool_request_middleware=True,
-                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                tool_request_middleware_trace=list(_tool_middleware_trace),
+                **dispatch_kwargs,
             )
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
+    def _execute_observed(next_args: Any) -> Any:
+        actual_args = next_args if isinstance(next_args, dict) else function_args
+        if isinstance(observed_args_out, dict):
+            # Freeze the arguments that reached the terminal dispatch. The
+            # concurrent verifier uses this to follow execution-middleware
+            # path rewrites without changing model-facing call arguments.
+            observed_args_out["args"] = dict(actual_args)
+        return _execute(actual_args)
+
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        _execute_observed,
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",

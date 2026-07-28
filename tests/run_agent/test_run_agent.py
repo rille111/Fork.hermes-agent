@@ -2723,8 +2723,8 @@ class TestConcurrentToolExecution:
                 mock_seq.assert_called_once()
                 mock_con.assert_not_called()
 
-    def test_disjoint_write_batch_forces_sequential(self, agent):
-        """Structured mutations stay ordered because middleware can alias paths."""
+    def test_disjoint_write_batch_uses_concurrent_path(self, agent):
+        """Independent file writes should still run concurrently."""
         tc1 = _mock_tool_call(
             name="write_file",
             arguments='{"path":"src/a.py","content":"print(1)"}',
@@ -2740,8 +2740,8 @@ class TestConcurrentToolExecution:
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
             with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_seq.assert_called_once()
-                mock_con.assert_not_called()
+                mock_con.assert_called_once()
+                mock_seq.assert_not_called()
 
     def test_overlapping_write_batch_forces_sequential(self, agent):
         """Writes to the same file must stay ordered."""
@@ -2845,6 +2845,423 @@ class TestConcurrentToolExecution:
         assert "alpha" in messages[0]["content"]
         assert "beta" in messages[1]["content"]
         assert "gamma" in messages[2]["content"]
+
+    def test_concurrent_failed_mutation_snapshots_before_batch_processing(
+        self,
+        agent,
+        tmp_path,
+        monkeypatch,
+    ):
+        target = tmp_path / "config.yaml"
+        target.write_text("before\n", encoding="utf-8")
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        snapshot_captured = threading.Event()
+
+        original_snapshot = agent._snapshot_failed_file_mutation_targets
+
+        def snapshot_then_signal(*args, **kwargs):
+            snapshots = original_snapshot(*args, **kwargs)
+            snapshot_captured.set()
+            return snapshots
+
+        monkeypatch.setattr(
+            agent,
+            "_snapshot_failed_file_mutation_targets",
+            snapshot_then_signal,
+        )
+
+        patch_call = _mock_tool_call(
+            name="patch",
+            arguments=json.dumps({
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "before",
+                "new_string": "after",
+            }),
+            call_id="c-patch",
+        )
+        recovery_call = _mock_tool_call(
+            name="web_search",
+            arguments='{"query":"recover"}',
+            call_id="c-recovery",
+        )
+        mock_msg = _mock_assistant_msg(
+            content="",
+            tool_calls=[patch_call, recovery_call],
+        )
+        messages = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            if name == "patch":
+                return json.dumps({
+                    "error": "protected config; use hermes config set",
+                })
+            assert snapshot_captured.wait(2.0)
+            target.write_text("after\n", encoding="utf-8")
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert agent._format_file_mutation_failure_footer(
+            agent._turn_failed_file_mutations,
+        ) == ""
+
+    def test_concurrent_mutation_ledger_uses_worker_completion_order(
+        self,
+        agent,
+        tmp_path,
+    ):
+        """Middleware can make nominally independent calls share a target."""
+        target = tmp_path / "shared.txt"
+        target.write_text("before\n", encoding="utf-8")
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_snapshot_budget = None
+        success_landed = threading.Event()
+
+        common_args = json.dumps({
+            "mode": "replace",
+            "path": str(target),
+            "old_string": "before",
+            "new_string": "after",
+        })
+        failure_call = _mock_tool_call(
+            name="patch",
+            arguments=common_args,
+            call_id="c-failure",
+        )
+        success_call = _mock_tool_call(
+            name="patch",
+            arguments=common_args,
+            call_id="c-success",
+        )
+        mock_msg = _mock_assistant_msg(
+            content="",
+            tool_calls=[failure_call, success_call],
+        )
+        messages = []
+
+        def fake_handle(_name, _args, _task_id, **kwargs):
+            if kwargs["tool_call_id"] == "c-success":
+                target.write_text("after\n", encoding="utf-8")
+                success_landed.set()
+                return json.dumps({"success": True})
+            assert success_landed.wait(2.0)
+            return json.dumps({"error": "late failure"})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        # Messages remain in model-required submission order, while verifier
+        # state reflects the real completion order: success, then failure.
+        assert [m["tool_call_id"] for m in messages] == [
+            "c-failure",
+            "c-success",
+        ]
+        assert str(target) in agent._turn_failed_file_mutations
+        # The ledger retains the later failure for unconfirmable backends, but
+        # the local footer sees that content changed after the pre-batch
+        # baseline even though the recovery sibling returned first.
+        assert agent._format_file_mutation_failure_footer(
+            agent._turn_failed_file_mutations,
+        ) == ""
+
+    def test_concurrent_verifier_uses_execution_middleware_target(
+        self,
+        agent,
+        tmp_path,
+    ):
+        raw_target = tmp_path / "raw.txt"
+        actual_target = tmp_path / "middleware-target.txt"
+        actual_target.write_text("before\n", encoding="utf-8")
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_snapshot_budget = None
+        tc = _mock_tool_call(
+            name="patch",
+            arguments=json.dumps({
+                "mode": "replace",
+                "path": str(raw_target),
+                "old_string": "missing",
+                "new_string": "after",
+            }),
+            call_id="c-middleware-target",
+        )
+
+        def rewrite_target(_name, args, next_call, **_context):
+            return next_call({**args, "path": str(actual_target)})
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                side_effect=rewrite_target,
+            ),
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps({"error": "replacement not found"}),
+            ),
+        ):
+            agent._execute_tool_calls_concurrent(
+                _mock_assistant_msg(content="", tool_calls=[tc]),
+                [],
+                "task-1",
+            )
+
+        assert str(actual_target) in agent._turn_failed_file_mutations
+        assert str(raw_target) not in agent._turn_failed_file_mutations
+
+    def test_sequential_verifier_uses_execution_middleware_target_and_baseline(
+        self,
+        agent,
+        tmp_path,
+    ):
+        raw_target = tmp_path / "raw.txt"
+        actual_target = tmp_path / "middleware-target.txt"
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"write_file"}
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_snapshot_budget = None
+        tc = _mock_tool_call(
+            name="write_file",
+            arguments=json.dumps({
+                "path": str(raw_target),
+                "content": "after\n",
+            }),
+            call_id="s-middleware-target",
+        )
+        dispatched = []
+
+        def rewrite_target(_name, args, next_call, **_context):
+            return next_call({**args, "path": str(actual_target)})
+
+        def fail_after_write(name, args, **_kwargs):
+            dispatched.append((name, dict(args)))
+            actual_target.write_text("after\n", encoding="utf-8")
+            return json.dumps({"error": "late failure"})
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                side_effect=rewrite_target,
+            ),
+            patch("model_tools.registry.dispatch", side_effect=fail_after_write),
+        ):
+            agent._execute_tool_calls_sequential(
+                _mock_assistant_msg(content="", tool_calls=[tc]),
+                [],
+                "task-1",
+            )
+
+        assert dispatched == [(
+            "write_file",
+            {"path": str(actual_target), "content": "after\n"},
+        )]
+        assert str(actual_target) in agent._turn_failed_file_mutations
+        assert str(raw_target) not in agent._turn_failed_file_mutations
+        assert agent._format_file_mutation_failure_footer(
+            agent._turn_failed_file_mutations,
+        ) == ""
+
+    @pytest.mark.parametrize("execution", ["sequential", "concurrent"])
+    def test_execution_middleware_short_circuit_preserves_failure(
+        self,
+        agent,
+        tmp_path,
+        execution,
+    ):
+        target = tmp_path / "target.txt"
+        target.write_text("before\n", encoding="utf-8")
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"write_file"}
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": str(target), "content": "old"},
+            json.dumps({"error": "first failure"}),
+            is_error=True,
+            failure_snapshots={str(target): None},
+        )
+        tc = _mock_tool_call(
+            name="write_file",
+            arguments=json.dumps({"path": str(target), "content": "new"}),
+            call_id=f"{execution}-short-circuit",
+        )
+
+        def short_circuit(_name, _args, _next_call, **_context):
+            return json.dumps({"bytes_written": 3})
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                side_effect=short_circuit,
+            ),
+            patch("model_tools.registry.dispatch") as dispatch,
+        ):
+            getattr(agent, f"_execute_tool_calls_{execution}")(
+                _mock_assistant_msg(content="", tool_calls=[tc]),
+                [],
+                "task-1",
+            )
+
+        dispatch.assert_not_called()
+        assert str(target) in agent._turn_failed_file_mutations
+
+    def test_direct_concurrent_file_mutations_are_serialized(self, agent, tmp_path):
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"write_file"}
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        active = 0
+        maximum_active = 0
+        lock = threading.Lock()
+
+        def delayed_dispatch(_name, args, _task_id, **kwargs):
+            nonlocal active, maximum_active
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                time.sleep(0.05)
+                observed = kwargs["observed_dispatch_out"]
+                observed["args"] = dict(args)
+                observed["result"] = json.dumps({"bytes_written": 1})
+                return observed["result"]
+            finally:
+                with lock:
+                    active -= 1
+
+        calls = [
+            _mock_tool_call(
+                name="write_file",
+                arguments=json.dumps({
+                    "path": str(tmp_path / f"file-{index}.txt"),
+                    "content": str(index),
+                }),
+                call_id=f"serialized-{index}",
+            )
+            for index in range(2)
+        ]
+        with patch("run_agent.handle_function_call", side_effect=delayed_dispatch):
+            agent._execute_tool_calls_concurrent(
+                _mock_assistant_msg(content="", tool_calls=calls),
+                [],
+                "task-1",
+            )
+
+        assert maximum_active == 1
+
+    def test_late_concurrent_worker_cannot_snapshot_in_next_turn(
+        self,
+        agent,
+        monkeypatch,
+        tmp_path,
+    ):
+        import agent.tool_executor as tool_executor
+
+        old_generation = object()
+        agent._file_mutation_turn_generation = old_generation
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"write_file"}
+        release = threading.Event()
+        returned = threading.Event()
+        snapshot_generations = []
+        traces = []
+
+        def delayed_invoke(*_args, **_kwargs):
+            traces.append(("delayed_invoke_start", agent._file_mutation_turn_generation))
+            release.wait(timeout=5)
+            returned.set()
+            traces.append(("delayed_invoke_return", agent._file_mutation_turn_generation))
+            return json.dumps({"error": "late failure"})
+
+        def capture_failed_snapshot(*_args, **_kwargs):
+            if threading.current_thread().name != "MainThread":
+                snapshot_generations.append(agent._file_mutation_turn_generation)
+            return {}
+
+        monkeypatch.setattr(tool_executor, "FILE_MUTATING_TOOL_NAMES", frozenset())
+        monkeypatch.setattr(
+            tool_executor,
+            "_resolve_concurrent_tool_timeout",
+            lambda: 0.01,
+        )
+        monkeypatch.setattr(agent, "_invoke_tool", delayed_invoke)
+        monkeypatch.setattr(
+            agent,
+            "_snapshot_file_mutation_targets",
+            lambda *_args, **_kwargs: {},
+        )
+        monkeypatch.setattr(
+            agent,
+            "_snapshot_failed_file_mutation_targets",
+            capture_failed_snapshot,
+        )
+        call = _mock_tool_call(
+            name="write_file",
+            arguments=json.dumps({
+                "path": str(tmp_path / "late.txt"),
+                "content": "late",
+            }),
+            call_id="late-worker",
+        )
+
+        agent._execute_tool_calls_concurrent(
+            _mock_assistant_msg(content="", tool_calls=[call]),
+            [],
+            "task-1",
+        )
+        agent._file_mutation_turn_generation = object()
+        traces.append(("main_thread_advanced", agent._file_mutation_turn_generation))
+        agent._turn_failed_file_mutations = {}
+        release.set()
+        assert returned.wait(timeout=2)
+        for _ in range(50):
+            if snapshot_generations:
+                break
+            time.sleep(0.01)
+
+        assert snapshot_generations == []
+
+    @pytest.mark.parametrize("execution", ["sequential", "concurrent"])
+    def test_verifier_uses_raw_dispatch_failure_before_result_transform(
+        self,
+        agent,
+        tmp_path,
+        execution,
+    ):
+        target = tmp_path / f"{execution}-target.txt"
+        target.write_text("before\n", encoding="utf-8")
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"patch"}
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_snapshot_budget = None
+        tc = _mock_tool_call(
+            name="patch",
+            arguments=json.dumps({
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "missing",
+                "new_string": "after",
+            }),
+            call_id=f"c-{execution}-raw-result",
+        )
+
+        def transformed_handle(_name, args, _task_id, **kwargs):
+            observed = kwargs["observed_dispatch_out"]
+            observed["args"] = dict(args)
+            observed["result"] = json.dumps({"error": "replacement not found"})
+            return json.dumps({"success": True})
+
+        with patch("run_agent.handle_function_call", side_effect=transformed_handle):
+            getattr(agent, f"_execute_tool_calls_{execution}")(
+                _mock_assistant_msg(content="", tool_calls=[tc]),
+                [],
+                "task-1",
+            )
+
+        assert str(target) in agent._turn_failed_file_mutations
 
     def test_concurrent_none_args_rejected_without_crash(self, agent):
         """Concurrent executor must not crash on arguments=None. Current
@@ -2954,6 +3371,93 @@ class TestConcurrentToolExecution:
         assert messages[1]["tool_call_id"] == "c2"
         assert all("Python interpreter is shutting down" in m["content"] for m in messages)
 
+    def test_concurrent_unsubmitted_mutation_does_not_create_verifier_failure(
+        self,
+        agent,
+        tmp_path,
+    ):
+        class ShutdownExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def submit(self, *args, **kwargs):
+                raise RuntimeError(
+                    "cannot schedule new futures after interpreter shutdown"
+                )
+
+            def shutdown(self, *args, **kwargs):
+                pass
+
+        target = tmp_path / "never-started.txt"
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        tc = _mock_tool_call(
+            name="write_file",
+            arguments=json.dumps({"path": str(target), "content": "new"}),
+            call_id="c-unsubmitted",
+        )
+        messages = []
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", ShutdownExecutor):
+            agent._execute_tool_calls_concurrent(
+                _mock_assistant_msg(content="", tool_calls=[tc]),
+                messages,
+                "task-1",
+            )
+
+        assert "was not started" in messages[0]["content"]
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_concurrent_timeout_does_not_record_queued_unstarted_mutation(
+        self,
+        agent,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        blocker = threading.Event()
+        mutation_started = threading.Event()
+        target = tmp_path / "queued.txt"
+        calls = [
+            _mock_tool_call(
+                name="web_search",
+                arguments=json.dumps({"q": f"block-{index}"}),
+                call_id=f"c{index}",
+            )
+            for index in range(8)
+        ]
+        calls.append(_mock_tool_call(
+            name="write_file",
+            arguments=json.dumps({"path": str(target), "content": "new"}),
+            call_id="c-queued",
+        ))
+        messages = []
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_snapshot_budget = None
+
+        def fake_handle(name, _args, _task_id, **_kwargs):
+            if name == "write_file":
+                mutation_started.set()
+                return json.dumps({"error": "must not run"})
+            blocker.wait(timeout=5)
+            return "late"
+
+        try:
+            with patch("run_agent.handle_function_call", side_effect=fake_handle):
+                agent._execute_tool_calls_concurrent(
+                    _mock_assistant_msg(content="", tool_calls=calls),
+                    messages,
+                    "task-1",
+                )
+        finally:
+            blocker.set()
+
+        assert not mutation_started.is_set()
+        assert "not started" in messages[-1]["content"]
+        assert messages[-1]["effect_disposition"] == "none"
+        assert agent._turn_failed_file_mutations == {}
+
     def test_concurrent_timeout_returns_finished_tools_without_hanging(self, agent, monkeypatch):
         """A wedged worker must not freeze the whole concurrent tool batch."""
         import threading
@@ -2995,6 +3499,57 @@ class TestConcurrentToolExecution:
         assert [batch[-1]["tool_call_id"] for batch in flushed] == ["c1", "c2"]
         assert "fast-result" in flushed[0][-1]["content"]
         assert "timed out after" in flushed[1][-1]["content"]
+
+    def test_concurrent_first_slot_timeout_records_file_mutation_failure(
+        self,
+        agent,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A missing first result must not reuse an uninitialised/stale status."""
+        import threading
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        blocker = threading.Event()
+        target = tmp_path / "config.yaml"
+        target.write_text("before\n", encoding="utf-8")
+        tc1 = _mock_tool_call(
+            name="patch",
+            arguments=json.dumps({
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "before",
+                "new_string": "after",
+            }),
+            call_id="c1",
+        )
+        tc2 = _mock_tool_call(
+            name="web_search",
+            arguments='{"q": "fast"}',
+            call_id="c2",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_snapshot_budget = None
+
+        def fake_handle(name, _args, _task_id, **_kwargs):
+            if name == "patch":
+                blocker.wait(timeout=5)
+                return json.dumps({"error": "late failure"})
+            return "fast-result"
+
+        try:
+            with patch("run_agent.handle_function_call", side_effect=fake_handle):
+                agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+        finally:
+            blocker.set()
+
+        assert len(messages) == 2
+        assert "timed out after" in messages[0]["content"]
+        assert messages[0]["effect_disposition"] == "unknown"
+        assert str(target) in agent._turn_failed_file_mutations
 
     def test_concurrent_timeout_prefers_late_real_result_over_timeout_message(self, agent, monkeypatch):
         """A worker that finishes in the window between the deadline snapshot
@@ -3770,7 +4325,7 @@ class TestParallelScopePathNormalization:
 
         monkeypatch.chdir(tmp_path)
 
-        scoped = _extract_parallel_scope_path("read_file", {"path": "./notes.txt"})
+        scoped = _extract_parallel_scope_path("write_file", {"path": "./notes.txt"})
 
         assert scoped == tmp_path / "notes.txt"
 
@@ -3780,8 +4335,8 @@ class TestParallelScopePathNormalization:
         monkeypatch.chdir(tmp_path)
         abs_path = tmp_path / "notes.txt"
 
-        rel_scoped = _extract_parallel_scope_path("read_file", {"path": "notes.txt"})
-        abs_scoped = _extract_parallel_scope_path("read_file", {"path": str(abs_path)})
+        rel_scoped = _extract_parallel_scope_path("write_file", {"path": "notes.txt"})
+        abs_scoped = _extract_parallel_scope_path("write_file", {"path": str(abs_path)})
 
         assert rel_scoped == abs_scoped
         assert _paths_overlap(rel_scoped, abs_scoped)
@@ -3792,6 +4347,25 @@ class TestParallelScopePathNormalization:
         monkeypatch.chdir(tmp_path)
         tc1 = _mock_tool_call(name="write_file", arguments='{"path":"notes.txt","content":"one"}', call_id="c1")
         tc2 = _mock_tool_call(name="write_file", arguments=f'{{"path":"{tmp_path / "notes.txt"}","content":"two"}}', call_id="c2")
+
+        assert not _should_parallelize_tool_batch([tc1, tc2])
+
+    def test_should_parallelize_tool_batch_serializes_independent_mutations(self):
+        from run_agent import _should_parallelize_tool_batch
+
+        tc1 = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"a.txt","content":"one"}',
+            call_id="c1",
+        )
+        tc2 = _mock_tool_call(
+            name="patch",
+            arguments=(
+                '{"mode":"replace","path":"b.txt",'
+                '"old_string":"old","new_string":"new"}'
+            ),
+            call_id="c2",
+        )
 
         assert not _should_parallelize_tool_batch([tc1, tc2])
 
@@ -4565,14 +5139,10 @@ class TestRunConversation:
 
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
-        # The bare "(empty)" sentinel is never delivered for reasoning-only
-        # exhaustion: the labeled reasoning excerpt (which may contain the
-        # answer) replaces it at the terminal. See
-        # test_empty_terminal_reasoning_surface.py; #34452's explainer still
-        # covers the truly-empty case.
+        # #34452: the bare "(empty)" sentinel is now replaced by a
+        # user-visible end-of-turn explanation so the failure isn't silent.
         assert result["final_response"] != "(empty)"
-        assert "only internal reasoning" in result["final_response"]
-        assert "reasoning only" in result["final_response"]
+        assert "No reply:" in result["final_response"]
         assert result["turn_exit_reason"] == "empty_response_exhausted"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
@@ -4593,12 +5163,9 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        # Reasoning-only exhaustion delivers the labeled reasoning excerpt
-        # instead of the bare "(empty)" sentinel (see
-        # test_empty_terminal_reasoning_surface.py).
+        # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
-        assert "only internal reasoning" in result["final_response"]
-        assert "structured reasoning answer" in result["final_response"]
+        assert "No reply:" in result["final_response"]
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):

@@ -1,3 +1,21 @@
+import pytest
+
+@pytest.fixture(autouse=True)
+def close_all_sessiondbs():
+    import hermes_state
+    dbs = []
+    original_init = hermes_state.SessionDB.__init__
+    def new_init(self, *args, **kwargs):
+        dbs.append(self)
+        original_init(self, *args, **kwargs)
+    hermes_state.SessionDB.__init__ = new_init
+    yield
+    hermes_state.SessionDB.__init__ = original_init
+    for db in dbs:
+        try:
+            db.close()
+        except Exception:
+            pass
 """Test: the context engine is notified of a compression-boundary rollover.
 
 When _compress_context rotates session_id (compression split), the active
@@ -43,7 +61,7 @@ class TestCompressionBoundaryHook:
     def test_on_session_start_called_with_compression_boundary(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
 
@@ -102,7 +120,7 @@ class TestCompressionBoundaryHook:
         from hermes_state import SessionDB
 
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
@@ -141,7 +159,7 @@ class TestCompressionBoundaryHook:
     def test_failure_before_persistence_does_not_notify(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
@@ -160,7 +178,7 @@ class TestCompressionBoundaryHook:
     def test_failure_during_persistence_does_not_notify(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
@@ -195,7 +213,7 @@ class TestCompressionBoundaryHook:
     def test_no_progress_does_not_notify(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
@@ -218,7 +236,7 @@ class TestCompressionBoundaryHook:
         from hermes_state import SessionDB
 
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
@@ -293,7 +311,7 @@ class TestCompressionBoundaryHook:
         """If the context engine raises from on_session_start, compression still completes."""
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
 
@@ -361,7 +379,7 @@ class TestSessionCompressEvent:
         from hermes_state import SessionDB
 
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(
                 db, event_callback=lambda et, ctx: events.append((et, ctx))
@@ -386,7 +404,7 @@ class TestSessionCompressEvent:
         """Compression must work when no event_callback is wired."""
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db, event_callback=None)
             agent.context_compressor = self._stub_compressor()
@@ -401,7 +419,7 @@ class TestSessionCompressEvent:
         def _boom(event_type, ctx):
             raise RuntimeError("hook exploded")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db, event_callback=_boom)
             original_sid = agent.session_id

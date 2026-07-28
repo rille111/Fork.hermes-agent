@@ -39,7 +39,9 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import posixpath
 import re
+import stat as stat_module
 import sys
 import tempfile
 import time
@@ -272,6 +274,7 @@ from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     file_mutation_result_landed,
 )
+
 from agent.trajectory import (
     convert_scratchpad_to_think,
     save_trajectory as _save_trajectory_to_file,
@@ -290,6 +293,65 @@ from agent.tool_dispatch_helpers import (
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
+
+
+_FILE_MUTATION_SNAPSHOT_LIMIT = 10
+_FILE_MUTATION_TARGET_INSPECTION_LIMIT = 100
+# Stable signatures read each eligible file twice. Across ten worker-time
+# snapshots and ten cached final checks, verifier content I/O stays <= 40 MiB.
+_FILE_MUTATION_SIGNATURE_MAX_BYTES = 1024 * 1024
+_FILE_MUTATION_SIGNATURE_TIMEOUT_SECONDS = 0.25
+_FILE_MUTATION_SNAPSHOT_BUDGET_INIT_LOCK = threading.Lock()
+_FILE_MUTATION_IO_MAX_WORKERS = 10
+_FILE_MUTATION_IO_EXECUTOR = None
+_FILE_MUTATION_IO_EXECUTOR_LOCK = threading.Lock()
+_FILE_MUTATION_IO_ADMISSION = threading.BoundedSemaphore(
+    _FILE_MUTATION_IO_MAX_WORKERS,
+)
+
+
+def _get_file_mutation_io_executor():
+    """Return the bounded process-wide pool for best-effort verifier I/O."""
+    global _FILE_MUTATION_IO_EXECUTOR
+    executor = _FILE_MUTATION_IO_EXECUTOR
+    if executor is not None:
+        return executor
+    with _FILE_MUTATION_IO_EXECUTOR_LOCK:
+        executor = _FILE_MUTATION_IO_EXECUTOR
+        if executor is None:
+            from tools.daemon_pool import DaemonThreadPoolExecutor
+
+            executor = DaemonThreadPoolExecutor(
+                max_workers=_FILE_MUTATION_IO_MAX_WORKERS,
+                thread_name_prefix="file-mutation-io",
+            )
+            _FILE_MUTATION_IO_EXECUTOR = executor
+    return executor
+
+
+def _submit_file_mutation_io(function, *args):
+    """Submit verifier I/O only when a bounded execution slot is available.
+
+    Timed-out filesystem calls cannot be killed safely in a Python thread. A
+    timed-out job therefore keeps its slot until it really exits; later probes
+    fail closed instead of appending cancelled work items to the executor's
+    unbounded internal queue.
+    """
+    admission = _FILE_MUTATION_IO_ADMISSION
+    if not admission.acquire(blocking=False):
+        return None
+
+    def _run_with_slot():
+        try:
+            return function(*args)
+        finally:
+            admission.release()
+
+    try:
+        return _get_file_mutation_io_executor().submit(_run_with_slot)
+    except Exception:
+        admission.release()
+        return None
 
 
 # Internal flags that mark a message as ephemeral empty-response/prefill
@@ -512,7 +574,7 @@ class AIAgent:
         command: str = None,
         args: list[str] | None = None,
         model: str = "",
-        max_iterations: int = 500,  # Default tool-calling iterations (shared with subagents)
+        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -1837,23 +1899,8 @@ class AIAgent:
                 # blocks. A list override, however, is the original clean
                 # multimodal payload (for example before a queued /model note)
                 # and must replace the API-local list once the turn is final.
-                # Preflight compaction can re-anchor this index at a message
-                # whose content was MERGED with the compaction summary
-                # (merge-summary-into-tail).  That is not an accident:
-                # ``reanchor_current_turn_user_idx`` falls back to the last
-                # user row precisely BECAUSE the merge rewrote the content and
-                # the exact-match lookup misses.  Overwriting it with the clean
-                # text would drop the summary from the continuation history the
-                # next turn is built from — the same hazard the DB-write twin
-                # below already refuses (see the sibling guard in
-                # ``_flush_messages_to_session_db_unlocked``).
-                if (
-                    override is not None
-                    and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
-                    and (
-                        not isinstance(msg.get("content"), list)
-                        or isinstance(override, list)
-                    )
+                if override is not None and (
+                    not isinstance(msg.get("content"), list) or isinstance(override, list)
                 ):
                     msg["content"] = override
                 if timestamp is not None:
@@ -2441,13 +2488,6 @@ class AIAgent:
             if ray_id:
                 parts.append(f"Ray {ray_id}")
             return " — ".join(parts)
-
-        # GeminiAPIError (agent/gemini_native_adapter.py) already composes a
-        # clean one-liner and may have appended actionable guidance (free-tier
-        # 429, legacy Standard-key 401). Prefer its message over re-extracting
-        # the raw response body below, which would strip that guidance.
-        if type(error).__name__ == "GeminiAPIError":
-            return redact_sensitive_text(raw[:1000])
 
         # JSON body errors from OpenAI/Anthropic SDKs
         body = getattr(error, "body", None)
@@ -3262,64 +3302,707 @@ class AIAgent:
             self._pending_steer = None
         return text
 
+    def _snapshot_failed_file_mutation_targets(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        result: Any,
+        is_error: bool,
+        task_id: str = "default",
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Snapshot failed targets immediately when a tool worker returns."""
+        if (
+            tool_name not in _FILE_MUTATING_TOOLS
+            or not is_error
+            or file_mutation_result_landed(tool_name, result)
+        ):
+            return {}
+        return self._snapshot_file_mutation_targets(tool_name, args, task_id)
+
+    def _snapshot_file_mutation_targets(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        task_id: str = "default",
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Snapshot bounded targets without assuming a completed tool result."""
+        if tool_name not in _FILE_MUTATING_TOOLS:
+            return {}
+        targets = list(dict.fromkeys(
+            _extract_file_mutation_targets(tool_name, args),
+        ))[:_FILE_MUTATION_TARGET_INSPECTION_LIMIT]
+        snapshots: Dict[str, Optional[Dict[str, Any]]] = {
+            path: None for path in targets
+        }
+
+        # Collapse cheap lexical aliases before spending any observation slots.
+        # This prevents repeated ``a/../file`` headers from starving later
+        # unique targets while keeping canonicalization I/O strictly bounded.
+        lexical_groups: Dict[str, Dict[str, Any]] = {}
+        for path in targets:
+            lexical_identity = self._file_mutation_target_identity(
+                path,
+                task_id,
+                allow_resolution=False,
+            )
+            lexical_group = lexical_groups.setdefault(
+                lexical_identity,
+                {"representative": path, "paths": []},
+            )
+            lexical_group["paths"].append(path)
+
+        # Reserve the turn-wide observation budget BEFORE path resolution.
+        # Canonicalization can itself block on network-backed filesystems, so
+        # budgeting only the later content read would still permit unbounded
+        # timed-out daemon workers.
+        granted = self._claim_file_mutation_snapshot_slots(len(lexical_groups))
+
+        # Resolve before hashing so aliases (relative/absolute, ``..``, or
+        # case-only Windows variants) share one content read. Keep the raw
+        # paths as mapping keys because the recorder and footer use exactly
+        # the paths reported by the tool call.
+        groups: Dict[str, Dict[str, Any]] = {}
+        for lexical_group in list(lexical_groups.values())[:granted]:
+            path = lexical_group["representative"]
+            resolved = self._resolved_file_mutation_target_path(path, task_id)
+            if resolved is None:
+                continue
+            canonical = os.path.normcase(os.path.normpath(resolved))
+            group = groups.setdefault(
+                canonical,
+                {"resolved": resolved, "paths": []},
+            )
+            group["paths"].extend(lexical_group["paths"])
+
+        for group in groups.values():
+            snapshot = self._snapshot_resolved_file_mutation_target(
+                group["resolved"],
+            )
+            for path in group["paths"]:
+                snapshots[path] = snapshot
+        return snapshots
+
+    def _claim_file_mutation_snapshot_slots(self, requested: int) -> int:
+        """Reserve bounded content-signature work across the whole turn."""
+        if requested <= 0:
+            return 0
+        budget = getattr(self, "_turn_file_mutation_snapshot_budget", None)
+        if not isinstance(budget, dict):
+            # Normal turns reset this attribute in ``build_turn_context``.
+            # The process-wide lock also keeps direct/concurrent test or API
+            # callers safe when they bypass that prologue.
+            with _FILE_MUTATION_SNAPSHOT_BUDGET_INIT_LOCK:
+                budget = getattr(
+                    self,
+                    "_turn_file_mutation_snapshot_budget",
+                    None,
+                )
+                if not isinstance(budget, dict):
+                    budget = {
+                        "remaining": _FILE_MUTATION_SNAPSHOT_LIMIT,
+                        "lock": threading.Lock(),
+                    }
+                    self._turn_file_mutation_snapshot_budget = budget
+        lock = budget.get("lock")
+        if lock is None:
+            return 0
+        with lock:
+            remaining = max(0, int(budget.get("remaining", 0)))
+            granted = min(requested, remaining)
+            budget["remaining"] = remaining - granted
+            return granted
+
     def _record_file_mutation_result(
         self,
         tool_name: str,
         args: Dict[str, Any],
         result: Any,
         is_error: bool,
-        *,
-        raw_result: Any = None,
-        dispatch: Optional[str] = None,
-        blocked: bool = False,
-        effective_task_id: str = "default",
-        turn_generation: Optional[int] = None,
+        task_id: str = "default",
+        failure_snapshots: Optional[
+            Dict[str, Optional[Dict[str, Any]]]
+        ] = None,
     ) -> None:
-        """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier."""
-        from agent.file_mutation_verifier import (
-            DispatchTriState,
-            ensure_verifier,
-            sync_legacy_failed_state,
-        )
+        """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
+        On failure, store ``{path: {error_preview, tool}}`` entries.  On
+        success, remove any prior failure entries for the same paths (the
+        model recovered within the turn).  Silently no-ops if the per-turn
+        state dict hasn't been initialised yet (e.g. a tool dispatched
+        outside ``run_conversation``).
+        """
+        if tool_name not in _FILE_MUTATING_TOOLS:
+            return
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
             return
-
-        verifier = ensure_verifier(self)
-        if dispatch is None:
-            tri = (
-                DispatchTriState.NOT_DISPATCHED
-                if blocked
-                else DispatchTriState.DISPATCHED
+        all_targets = list(dict.fromkeys(
+            _extract_file_mutation_targets(tool_name, args),
+        ))
+        overflow_count = max(
+            0,
+            len(all_targets) - (_FILE_MUTATION_TARGET_INSPECTION_LIMIT - 1),
+        )
+        targets = all_targets[
+            : (
+                _FILE_MUTATION_TARGET_INSPECTION_LIMIT - 1
+                if overflow_count
+                else _FILE_MUTATION_TARGET_INSPECTION_LIMIT
             )
-        else:
-            tri = DispatchTriState(dispatch)
-        raw = raw_result if raw_result is not None else result
-        verifier.record_tool_outcome(
-            tool_name=tool_name,
-            effective_args=args,
-            effective_task_id=effective_task_id or "default",
-            raw_result=raw,
-            dispatch=tri,
-            model_is_error=is_error,
-            blocked=blocked,
-            turn_generation=turn_generation,
-        )
-        verifier.observe_after_tool(
-            tool_name=tool_name,
-            effective_task_id=effective_task_id or "default",
-            blocked=blocked,
-        )
-        sync_legacy_failed_state(self)
-        if tool_name in _FILE_MUTATING_TOOLS and not blocked and tri is DispatchTriState.DISPATCHED:
-            landed = file_mutation_result_landed(tool_name, raw)
-            if landed:
-                changed = getattr(self, "_turn_file_mutation_paths", None)
-                if changed is not None:
-                    changed.update(
-                        _extract_landed_file_mutation_paths(tool_name, args, raw)
+        ]
+        if not targets:
+            return
+        operation_digest = None
+        overflow_scope_identity = None
+        if overflow_count:
+            try:
+                encoded_operation = json.dumps(
+                    {"tool": tool_name, "args": args},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8", errors="surrogatepass")
+                operation_digest = hashlib.sha256(encoded_operation).hexdigest()
+            except (TypeError, ValueError, UnicodeError):
+                pass
+            overflow_scope_identity = self._file_mutation_target_identity(
+                ".",
+                task_id,
+                allow_resolution=False,
+            )
+        landed = file_mutation_result_landed(tool_name, result)
+        if landed:
+            changed = getattr(self, "_turn_file_mutation_paths", None)
+            if changed is not None:
+                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
+        if is_error and not landed:
+            preview = _extract_error_preview(result)
+            if failure_snapshots is None:
+                failure_snapshots = self._snapshot_failed_file_mutation_targets(
+                    tool_name,
+                    args,
+                    result,
+                    is_error,
+                    task_id,
+                )
+            entries = []
+            seen_identities = set()
+            for path in targets:
+                snapshot = failure_snapshots.get(path)
+                lexical_identity = self._file_mutation_target_identity(
+                    path,
+                    task_id,
+                    allow_resolution=False,
+                )
+                identity = self._file_mutation_target_identity(
+                    path,
+                    task_id,
+                    snapshot,
+                    allow_resolution=False,
+                )
+                if {identity, lexical_identity} & seen_identities:
+                    continue
+                seen_identities.update((identity, lexical_identity))
+                entries.append((path, identity, lexical_identity, snapshot))
+            for path, identity, lexical_identity, snapshot in entries:
+                existing_path = next(
+                    (
+                        candidate
+                        for candidate, info in state.items()
+                        if info.get("_task_id", task_id) == task_id
+                        and (
+                            identity in {
+                                info.get("_target_identity"),
+                                info.get("_lexical_identity"),
+                            }
+                            or lexical_identity in {
+                                info.get("_target_identity"),
+                                info.get("_lexical_identity"),
+                            }
+                        )
+                    ),
+                    None,
+                )
+                state_path = existing_path or f"{task_id}:{path}"
+                # Keep the FIRST error we saw for a given path unless we
+                # later see success.  A repeated failure with a different
+                # message shouldn't silently overwrite the original. Refresh
+                # the snapshot, though, so only recovery after the LATEST
+                # failed attempt can suppress the footer.
+                if state_path not in state:
+                    state[state_path] = {
+                        "tool": tool_name,
+                        "error_preview": preview,
+                        "disk_snapshot": snapshot,
+                        "_target_identity": identity,
+                        "_lexical_identity": lexical_identity,
+                        "_task_id": task_id,
+                        "_display_path": path,
+                    }
+                else:
+                    state[state_path]["disk_snapshot"] = snapshot
+            if overflow_count:
+                scope_digest = hashlib.sha256(
+                    str(overflow_scope_identity).encode(
+                        "utf-8",
+                        errors="surrogatepass",
                     )
+                ).hexdigest()[:16]
+                overflow_key = (
+                    "\x00file-mutation-overflow:"
+                    f"{scope_digest}:{operation_digest or 'unmatchable'}"
+                )
+                state[overflow_key] = {
+                    "tool": tool_name,
+                    "error_preview": preview,
+                    "disk_snapshot": None,
+                    "_display_path": (
+                        f"{overflow_count} additional file target(s) "
+                        "(exact batch retry required)"
+                    ),
+                    "_mutation_failure_overflow": True,
+                    "_overflow_count": overflow_count,
+                    "_overflow_operation_digest": operation_digest,
+                    "_overflow_scope_identity": overflow_scope_identity,
+                    "_task_id": task_id,
+                }
+        elif landed:
+            if operation_digest is not None:
+                for state_path, info in list(state.items()):
+                    if (
+                        info.get("_mutation_failure_overflow")
+                        and info.get("_overflow_operation_digest")
+                        == operation_digest
+                        and info.get("_overflow_scope_identity")
+                        == overflow_scope_identity
+                    ):
+                        state.pop(state_path, None)
+            if not state:
+                return
+            resolution_grant = self._claim_file_mutation_snapshot_slots(
+                len(targets),
+            )
+            successful_identities = set()
+            for index, path in enumerate(targets):
+                successful_identities.add(
+                    self._file_mutation_target_identity(
+                        path,
+                        task_id,
+                        allow_resolution=False,
+                    )
+                )
+                if index < resolution_grant:
+                    successful_identities.add(
+                        self._file_mutation_target_identity(
+                            path,
+                            task_id,
+                            allow_resolution=True,
+                        )
+                    )
+            for state_path, info in list(state.items()):
+                identity = info.get("_target_identity")
+                if identity is None:
+                    identity = self._file_mutation_target_identity(
+                        state_path,
+                        task_id,
+                        info.get("disk_snapshot"),
+                        allow_resolution=False,
+                    )
+                lexical_identity = info.get("_lexical_identity")
+                if lexical_identity is None:
+                    lexical_identity = self._file_mutation_target_identity(
+                        state_path,
+                        task_id,
+                        allow_resolution=False,
+                    )
+                if {identity, lexical_identity} & successful_identities:
+                    if info.get("_task_id", task_id) == task_id:
+                        state.pop(state_path, None)
+
+    @classmethod
+    def _file_mutation_target_identity(
+        cls,
+        path: str,
+        task_id: str = "default",
+        snapshot: Optional[Dict[str, Any]] = None,
+        allow_resolution: bool = True,
+    ) -> str:
+        """Return a stable local or lexical identity for ledger matching."""
+        resolved = snapshot.get("path") if isinstance(snapshot, dict) else None
+        if not isinstance(resolved, str) and allow_resolution:
+            resolved = cls._resolved_file_mutation_target_path(path, task_id)
+        if isinstance(resolved, str):
+            canonical = os.path.normcase(os.path.normpath(resolved))
+            return f"local:{canonical}"
+
+        # When host resolution is unavailable, collapse harmless lexical
+        # aliases but scope them to the backing authority. A success from SSH
+        # or another remote task must never clear a local or cross-task failure.
+        try:
+            from tools.file_tools import _terminal_env_type_for_task_strict
+
+            backend = str(_terminal_env_type_for_task_strict(task_id)).strip().lower()
+            if not backend:
+                backend = "unknown"
+        except Exception:
+            backend = "unknown"
+        host_windows = backend == "local" and os.name == "nt"
+        raw_path = str(path)
+        normalized = posixpath.normpath(
+            raw_path.replace("\\", "/") if host_windows else raw_path
+        )
+        windows_lexical_path = host_windows and bool(
+            re.match(r"^[A-Za-z]:/", normalized)
+        )
+        if host_windows:
+            normalized = normalized.casefold()
+
+        authority_task = task_id or "default"
+        if backend in {"docker", "singularity", "modal", "daytona", "ssh"}:
+            try:
+                from tools.terminal_tool import _resolve_container_task_id
+
+                resolved_authority = _resolve_container_task_id(task_id)
+                if isinstance(resolved_authority, str) and resolved_authority:
+                    authority_task = resolved_authority
+            except Exception:
+                pass
+        authority = (
+            ["local"]
+            if backend == "local"
+            else [str(backend), str(authority_task)]
+        )
+        is_absolute = (
+            posixpath.isabs(normalized)
+            or windows_lexical_path
+            or normalized.startswith("//")
+        )
+        if not is_absolute:
+            try:
+                from tools.file_tools import _authoritative_workspace_root
+
+                workspace_root = _authoritative_workspace_root(task_id)
+            except Exception:
+                workspace_root = None
+            if not workspace_root and backend == "local":
+                try:
+                    workspace_root = os.getcwd()
+                except Exception:
+                    workspace_root = None
+            if workspace_root:
+                raw_workspace = str(workspace_root)
+                workspace = posixpath.normpath(
+                    raw_workspace.replace("\\", "/")
+                    if host_windows
+                    else raw_workspace
+                )
+                if host_windows:
+                    workspace = workspace.casefold()
+                normalized = posixpath.normpath(
+                    posixpath.join(workspace, normalized)
+                )
+                if host_windows:
+                    normalized = normalized.casefold()
+            else:
+                # Unknown workspace means different task ids cannot safely alias.
+                authority.extend(["workspace-task", str(task_id or "default")])
+        return "lexical:" + json.dumps(
+            [*authority, normalized],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _file_mutation_path_is_unsafe(path: str) -> bool:
+        """Reject Windows device and network paths before any blocking I/O."""
+        if getattr(os, "name", "") != "nt":
+            return False
+        normalized = str(path).replace("/", "\\")
+        upper = normalized.upper()
+        # Extended/device namespaces bypass normal Win32 path parsing and can
+        # name pipes, kernel devices, or remote storage. The verifier never
+        # needs them, including the nominally local ``\\?\C:\...`` form.
+        if upper.startswith(("\\\\?\\", "\\\\.\\", "\\??\\", "\\\\??\\")):
+            return True
+        if normalized.startswith("\\\\"):
+            return True
+
+        # ``Z:dir\file`` is relative to the process-wide current directory on
+        # drive Z, which is neither task-relative nor safely classifiable. It
+        # may also select a mapped network drive without an absolute root.
+        if re.match(r"^[A-Za-z]:(?:$|[^\\])", normalized):
+            return True
+
+        reserved = {"CON", "PRN", "AUX", "NUL", "CLOCK$"}
+        for index, component in enumerate(normalized.split("\\")):
+            if not component:
+                continue
+            if index == 0 and re.fullmatch(r"[A-Za-z]:", component):
+                continue
+            # Windows ignores trailing spaces/dots and treats the suffix after
+            # the first dot as an extension when recognizing DOS devices.
+            device_name = component.rstrip(" .").split(":", 1)[0]
+            device_name = device_name.split(".", 1)[0].rstrip(" .").upper()
+            if (
+                device_name in reserved
+                or re.fullmatch(r"COM[1-9]", device_name)
+                or re.fullmatch(r"LPT[1-9]", device_name)
+            ):
+                return True
+
+        drive_path = normalized
+        if (
+            len(drive_path) >= 3
+            and drive_path[0].isalpha()
+            and drive_path[1:3] == ":\\"
+        ):
+            try:
+                import ctypes
+
+                # DRIVE_REMOTE = 4. Avoid verifier reads from mapped shares,
+                # which can stall turn finalization when a server is offline.
+                return ctypes.windll.kernel32.GetDriveTypeW(drive_path[:3]) == 4
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _resolved_file_mutation_target_path(
+        path: str,
+        task_id: str = "default",
+    ) -> Optional[str]:
+        """Resolve a confirmed-local target within the verifier I/O deadline."""
+        if AIAgent._file_mutation_path_is_unsafe(path):
+            return None
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+        future = _submit_file_mutation_io(
+            AIAgent._resolved_file_mutation_target_path_sync,
+            path,
+            task_id,
+        )
+        if future is None:
+            return None
+        try:
+            return future.result(timeout=_FILE_MUTATION_SIGNATURE_TIMEOUT_SECONDS)
+        except FuturesTimeoutError:
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _resolved_file_mutation_target_path_sync(
+        path: str,
+        task_id: str = "default",
+    ) -> Optional[str]:
+        """Resolve a confirmed-local target, or return None for remote paths."""
+        try:
+            from tools.file_tools import (
+                _resolve_local_path_for_task_lexically,
+                _terminal_env_type_for_task_strict,
+            )
+            from agent.file_safety import get_file_verifier_block_error
+
+            if _terminal_env_type_for_task_strict(task_id) != "local":
+                return None
+            resolved = str(_resolve_local_path_for_task_lexically(path, task_id))
+            if AIAgent._file_mutation_path_is_unsafe(resolved):
+                return None
+            if get_file_verifier_block_error(resolved) is not None:
+                return None
+            return resolved
+        except Exception:
+            return None
+
+    @staticmethod
+    def _file_mutation_path_has_link_component(path: str) -> bool:
+        """Reject symlink/reparse traversal before opening a verifier target."""
+        try:
+            absolute = os.path.abspath(path)
+            drive, tail = os.path.splitdrive(absolute)
+            root = drive + os.sep if tail.startswith(("/", "\\")) else drive
+            current = root
+            for component in tail.replace("\\", "/").split("/"):
+                if not component:
+                    continue
+                current = os.path.join(current, component) if current else component
+                try:
+                    value = os.lstat(current)
+                except FileNotFoundError:
+                    return False
+                except OSError:
+                    return True
+                if stat_module.S_ISLNK(value.st_mode):
+                    return True
+                attributes = getattr(value, "st_file_attributes", 0)
+                reparse_flag = getattr(
+                    stat_module,
+                    "FILE_ATTRIBUTE_REPARSE_POINT",
+                    0x400,
+                )
+                if attributes & reparse_flag:
+                    return True
+            return False
+        except Exception:
+            return True
+
+    @staticmethod
+    def _snapshot_resolved_file_mutation_target(
+        resolved: str,
+    ) -> Optional[Dict[str, Any]]:
+        signature = AIAgent._file_mutation_disk_signature(resolved)
+        if signature is None:
+            return None
+        return {"path": resolved, "signature": signature}
+
+    @classmethod
+    def _snapshot_file_mutation_target(
+        cls,
+        path: str,
+        task_id: str = "default",
+    ) -> Optional[Dict[str, Any]]:
+        """Capture enough local filesystem state to detect later recovery.
+
+        A failed file-tool write can be recovered through another tool, such
+        as ``terminal`` running the supported ``hermes config set`` command.
+        The verifier cannot infer arbitrary shell effects, so it records the
+        target's on-disk identity at failure time and compares it at turn end.
+        Remote/container paths deliberately return ``None`` because the host
+        process cannot stat those paths reliably.
+        """
+        resolved = cls._resolved_file_mutation_target_path(path, task_id)
+        if resolved is None:
+            return None
+        return cls._snapshot_resolved_file_mutation_target(resolved)
+
+    @staticmethod
+    def _file_mutation_disk_signature(path: str) -> Optional[tuple]:
+        """Return a bounded signature without allowing filesystem I/O to wedge."""
+        if AIAgent._file_mutation_path_is_unsafe(path):
+            return None
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+        future = _submit_file_mutation_io(
+            AIAgent._file_mutation_disk_signature_sync,
+            path,
+        )
+        if future is None:
+            return None
+        try:
+            return future.result(timeout=_FILE_MUTATION_SIGNATURE_TIMEOUT_SECONDS)
+        except FuturesTimeoutError:
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _file_mutation_disk_signature_sync(path: str) -> Optional[tuple]:
+        """Return a content signature, distinguishing missing from unreadable."""
+        # Reject Windows device/network paths before opening them. POSIX
+        # devices and FIFOs are opened non-blocking below, then rejected via
+        # descriptor-level fstat.
+        if AIAgent._file_mutation_path_is_unsafe(path):
+            return None
+        try:
+            from agent.file_safety import get_file_verifier_block_error
+
+            if get_file_verifier_block_error(path) is not None:
+                return None
+        except Exception:
+            return None
+        if AIAgent._file_mutation_path_has_link_component(path):
+            return None
+        flags = os.O_RDONLY
+        for flag_name in ("O_BINARY", "O_NONBLOCK", "O_NOFOLLOW", "O_NOINHERIT"):
+            flags |= getattr(os, flag_name, 0)
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return ("missing",)
+        except OSError:
+            return None
+        try:
+            file_stat = os.fstat(fd)
+            # Never read devices, pipes, or unexpectedly huge files from a
+            # turn-finalization safeguard. The descriptor-level check closes
+            # the stat/open race; bounded os.read calls prevent growing files
+            # from bypassing the limit.
+            if (
+                not stat_module.S_ISREG(file_stat.st_mode)
+                or file_stat.st_size > _FILE_MUTATION_SIGNATURE_MAX_BYTES
+            ):
+                return None
+            def _stat_identity(value: Any) -> tuple:
+                return (
+                    value.st_mode,
+                    value.st_size,
+                    getattr(value, "st_dev", None),
+                    getattr(value, "st_ino", None),
+                    getattr(value, "st_mtime_ns", None),
+                    getattr(value, "st_ctime_ns", None),
+                )
+
+            def _read_digest() -> Optional[bytes]:
+                os.lseek(fd, 0, os.SEEK_SET)
+                digest = hashlib.sha256()
+                remaining = file_stat.st_size
+                while remaining:
+                    chunk = os.read(fd, min(1024 * 1024, remaining))
+                    if not chunk or len(chunk) > remaining:
+                        return None
+                    remaining -= len(chunk)
+                    digest.update(chunk)
+                # Reject growth that happened after the descriptor stat.
+                if os.read(fd, 1):
+                    return None
+                return digest.digest()
+
+            identity = _stat_identity(file_stat)
+            first_digest = _read_digest()
+            if first_digest is None or _stat_identity(os.fstat(fd)) != identity:
+                return None
+            second_digest = _read_digest()
+            if (
+                second_digest is None
+                or second_digest != first_digest
+                or _stat_identity(os.fstat(fd)) != identity
+            ):
+                return None
+            return ("present", file_stat.st_size, second_digest)
+        except OSError:
+            return None
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    @classmethod
+    def _file_mutation_was_recovered(
+        cls,
+        info: Dict[str, Any],
+        signature_cache: Optional[Dict[str, Optional[tuple]]] = None,
+    ) -> bool:
+        """Return True when the failed target changed later through another path.
+
+        This is deliberately a content-transition check, not a semantic patch
+        validator: external recovery tools are opaque to the agent, and the
+        footer only claims whether a later content change was confirmed.
+        """
+        snapshot = info.get("disk_snapshot") if isinstance(info, dict) else None
+        if not isinstance(snapshot, dict):
+            return False
+        path = snapshot.get("path")
+        before = snapshot.get("signature")
+        if not isinstance(path, str) or before is None:
+            return False
+        if signature_cache is not None and path in signature_cache:
+            after = signature_cache[path]
+        else:
+            after = cls._file_mutation_disk_signature(path)
+            if signature_cache is not None:
+                signature_cache[path] = after
+        return after is not None and after != before
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
@@ -3360,6 +4043,25 @@ class AIAgent:
         r"(?<![/:\w.`])(?:~/|/|[A-Za-z]:[/\\])(?:[\w.\-]+[/\\])*[\w.\-]+\.[\w]+",
     )
 
+    @staticmethod
+    def _sanitize_footer_field(value: Any) -> str:
+        """Keep model-controlled footer fields inside one rendered line/span."""
+        text = str(value)
+        sanitized = "".join(
+            "ˋ"
+            if character == "`"
+            else " "
+            if character.isspace() and character != " "
+            else character
+            if character.isprintable()
+            else "�"
+            for character in text
+        )
+        # Explicit MEDIA directives are attachment-capable even inside inline
+        # code. Replace the ASCII colon in every model-controlled occurrence
+        # so gateway extractors can only render it as inert text.
+        return re.sub(r"MEDIA:", "MEDIA꞉", sanitized, flags=re.IGNORECASE)
+
     @classmethod
     def _neutralize_footer_paths(cls, text: str) -> str:
         """Wrap bare file paths in backticks so they aren't auto-delivered.
@@ -3391,14 +4093,45 @@ class AIAgent:
         bare-path media extractor can never auto-attach a protected file
         (e.g. ``~/.hermes/config.yaml``) to a messaging channel (#35584).
         """
-        from agent.file_mutation_verifier import format_failure_footer
-
         if not failed:
             return ""
-        return format_failure_footer(
-            dict(failed),
-            format_paths=cls._neutralize_footer_paths,
-        )
+        signature_cache: Dict[str, Optional[tuple]] = {}
+        unresolved = {
+            path: info
+            for path, info in failed.items()
+            if not cls._file_mutation_was_recovered(info, signature_cache)
+        }
+        if not unresolved:
+            return ""
+        lines = [
+            "⚠️ File-mutation verifier: unresolved failed file-tool mutations "
+            f"for {len(unresolved)} file(s); no later content change was "
+            "confirmed. Run `git status` or `read_file` to verify final state."
+        ]
+        shown = 0
+        for path, info in unresolved.items():
+            if shown >= 10:
+                break
+            preview = cls._neutralize_footer_paths(
+                cls._sanitize_footer_field(
+                    (info.get("error_preview") or "").strip()
+                )
+            )
+            tool = cls._neutralize_footer_paths(
+                cls._sanitize_footer_field(info.get("tool") or "patch")
+            )
+            safe_path = cls._sanitize_footer_field(
+                info.get("_display_path", path)
+            )
+            if preview:
+                lines.append(f"  • `{safe_path}` — [{tool}] {preview}")
+            else:
+                lines.append(f"  • `{safe_path}` — [{tool}] failed")
+            shown += 1
+        remaining = len(unresolved) - shown
+        if remaining > 0:
+            lines.append(f"  • … and {remaining} more")
+        return "\n".join(lines)
 
     def _turn_completion_explainer_enabled(self) -> bool:
         """Check whether the end-of-turn completion explainer footer is on.
@@ -4296,83 +5029,6 @@ class AIAgent:
             else:
                 logger.warning("Removed duplicate tool call: %s", tc.function.name)
         return unique if len(unique) < len(tool_calls) else tool_calls
-
-    @staticmethod
-    def _uniquify_tool_call_ids(tool_calls: list) -> list:
-        """Ensure every tool call in a single assistant turn has a distinct id.
-
-        Some models/providers reuse one call id across different calls in a
-        single batch (observed with native Kimi Responses replays, Ollama-
-        compatible endpoints, and degraded models at long context; same bug
-        class as openclaw/openclaw#110518 / #110956). Duplicate ids are lossy
-        downstream: the pre-API sanitizer keeps only the first call/result
-        pair per id (#58327), so the later call's result silently vanishes
-        from every replayed payload, and strict providers (Anthropic
-        tool_use, DeepSeek) reject duplicate ids outright.
-
-        The first occurrence keeps its id; later collisions get a
-        deterministic ``<id>_d<n>`` suffix — never a random UUID, which would
-        break prompt-cache prefix stability across replays. Mutates the
-        entries in place (SDK models / SimpleNamespace / dicts) and returns
-        the same list. Blank/missing ids are left for the deterministic
-        fallback in ``build_assistant_message``.
-        """
-        seen: set = set()
-        for tc in tool_calls or []:
-            if isinstance(tc, dict):
-                raw = tc.get("call_id") or tc.get("id") or ""
-            else:
-                raw = getattr(tc, "call_id", None) or getattr(tc, "id", None) or ""
-            raw = raw.strip() if isinstance(raw, str) else ""
-            if not raw:
-                continue
-            # Composite Responses ids ("call_x|fc_y") collide on the call
-            # half — that's the pairing key providers enforce per turn.
-            cid = raw.split("|", 1)[0]
-            if not cid:
-                continue
-            if cid not in seen:
-                seen.add(cid)
-                continue
-            n = 2
-            new_id = f"{cid}_d{n}"
-            while new_id in seen:
-                n += 1
-                new_id = f"{cid}_d{n}"
-            seen.add(new_id)
-
-            def _renamed(value):
-                # Preserve a composite id's response-item half so the
-                # provider's real fc_/item id survives the rename.
-                if isinstance(value, str) and "|" in value:
-                    return f"{new_id}|{value.split('|', 1)[1]}"
-                return new_id
-
-            try:
-                if isinstance(tc, dict):
-                    if tc.get("id"):
-                        tc["id"] = _renamed(tc["id"])
-                    else:
-                        tc["id"] = new_id
-                    if tc.get("call_id"):
-                        tc["call_id"] = new_id
-                else:
-                    tc.id = _renamed(getattr(tc, "id", None))
-                    if getattr(tc, "call_id", None):
-                        tc.call_id = new_id
-            except Exception:
-                logger.warning(
-                    "Could not uniquify duplicate tool call id %s", cid
-                )
-                continue
-            _fn = tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
-            _fn_name = (_fn.get("name") if isinstance(_fn, dict) else getattr(_fn, "name", None)) or "?"
-            logger.warning(
-                "Model reused tool call id %s within one turn; renamed the "
-                "duplicate to %s (tool=%s) to keep call/result pairing "
-                "lossless.", cid, new_id, _fn_name,
-            )
-        return tool_calls
 
     def _repair_tool_call(self, tool_name: str) -> str | None:
         """Forwarder — see ``agent.agent_runtime_helpers.repair_tool_call``."""
@@ -6790,7 +7446,8 @@ class AIAgent:
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,
                      skip_tool_request_middleware: bool = False,
-                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None) -> str:
+                     tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
+                     observed_args_out: Optional[Dict[str, Any]] = None) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
@@ -6803,6 +7460,7 @@ class AIAgent:
             pre_tool_block_checked,
             skip_tool_request_middleware,
             tool_request_middleware_trace,
+            observed_args_out,
         )
 
     @staticmethod

@@ -355,9 +355,34 @@ class TestFileMutationTargets:
                 "mode": "patch",
                 "patch": (
                     "*** Begin Patch\n"
-                    "*** Move File: old/name.py -> new/name.py\n"
+                    "***Move File: old/name.py -> new/name.py\n"
                     "*** End Patch\n"
                 ),
             },
         )
         assert targets == ["old/name.py", "new/name.py"]
+
+    def test_v4a_targets_preserve_header_order_across_moves(self):
+        targets = _extract_file_mutation_targets(
+            "patch",
+            {
+                "mode": "patch",
+                "patch": (
+                    "***" " Begin Patch\n"
+                    "***" " Move File: first-old.py -> first-new.py\n"
+                    "***" " Update File: middle.py\n"
+                    "***" " Add File: added.py\n"
+                    "***" " Move File: last-old.py -> last-new.py\n"
+                    "***" " End Patch\n"
+                ),
+            },
+        )
+
+        assert targets == [
+            "first-old.py",
+            "first-new.py",
+            "middle.py",
+            "added.py",
+            "last-old.py",
+            "last-new.py",
+        ]
