@@ -540,6 +540,42 @@ class TestRecoveredThenFailedAgain:
         assert "second" in failed["retry.py"]["error_preview"]
 
 
+class TestLedgerOverflow:
+    def test_exact_successful_retry_clears_all_overflowed_failures(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        paths = [f"file-{index}.txt" for index in range(65)]
+        patch_lines = ["*** " + "Begin Patch"]
+        for path in paths:
+            patch_lines.extend((f"*** Add File: {path}", "+content"))
+        patch_lines.append("*** " + "End Patch")
+        args = {"mode": "patch", "patch": "\n".join(patch_lines)}
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
+        verifier.reset_turn(1)
+
+        verifier.record_tool_outcome(
+            tool_name="patch",
+            effective_args=args,
+            effective_task_id="default",
+            raw_result=json.dumps({"success": False, "error": "failed"}),
+            dispatch=DispatchTriState.DISPATCHED,
+            model_is_error=True,
+            turn_generation=1,
+        )
+        assert "__overflow__" in verifier.finalize_failed_dict()
+
+        verifier.record_tool_outcome(
+            tool_name="patch",
+            effective_args=args,
+            effective_task_id="default",
+            raw_result=json.dumps({"success": True, "files_modified": paths}),
+            dispatch=DispatchTriState.DISPATCHED,
+            model_is_error=False,
+            turn_generation=1,
+        )
+
+        assert verifier.finalize_failed_dict() == {}
+
+
 def _slow_fingerprint_worker(path_str, out_q):
     import time
 

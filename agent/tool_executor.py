@@ -38,6 +38,7 @@ from agent.tool_dispatch_helpers import (
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
+    _extract_file_mutation_targets,
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
@@ -61,8 +62,8 @@ def _ensure_file_checkpoint(
     effective_task_id: str,
 ) -> None:
     """Checkpoint the same workspace path that the file tool will mutate."""
-    file_path = function_args.get("path", "")
-    if not file_path:
+    file_paths = _extract_file_mutation_targets(function_name, function_args)
+    if not file_paths:
         return
 
     # File tools resolve relative paths against the task's live/session cwd,
@@ -71,9 +72,17 @@ def _ensure_file_checkpoint(
     # discover the project root.
     from tools.file_tools import _resolve_path_for_task
 
-    resolved_path = _resolve_path_for_task(file_path, effective_task_id or "default")
-    work_dir = agent._checkpoint_mgr.get_working_dir_for_path(str(resolved_path))
-    agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
+    checkpointed_work_dirs = set()
+    for file_path in file_paths:
+        resolved_path = _resolve_path_for_task(
+            file_path,
+            effective_task_id or "default",
+        )
+        work_dir = agent._checkpoint_mgr.get_working_dir_for_path(str(resolved_path))
+        if work_dir in checkpointed_work_dirs:
+            continue
+        checkpointed_work_dirs.add(work_dir)
+        agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
