@@ -589,13 +589,14 @@ def test_cmd_update_reloads_runtime_modules_before_lazy_refresh(monkeypatch, tmp
     events = []
 
     def fake_run(cmd, **kwargs):
-        if cmd == ["git", "fetch", "origin", "main"]:
+        git_cmd = _without_git_config_options(cmd)
+        if git_cmd == ["git", "fetch", "origin", "main"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
-        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+        if git_cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+        if git_cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "merge", "--ff-only", "origin/main"]:
+        if git_cmd == ["git", "merge", "--ff-only", "origin/main"]:
             events.append("pull")
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         if "pip" in cmd and "install" in cmd:

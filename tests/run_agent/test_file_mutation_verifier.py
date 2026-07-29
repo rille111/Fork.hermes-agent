@@ -165,6 +165,27 @@ def _bare_agent() -> AIAgent:
     return agent
 
 
+
+def _mutation_entries(state: dict, path: str) -> list[dict]:
+    """Return ledger entries whose display/key path matches *path*."""
+    out = []
+    for key, info in state.items():
+        display = info.get("_display_path") if isinstance(info, dict) else None
+        if display == path or key == path or str(key).endswith(":" + path) or str(key).endswith(path):
+            out.append(info if isinstance(info, dict) else {"_key": key})
+    return out
+
+
+def _has_mutation(state: dict, path: str) -> bool:
+    return bool(_mutation_entries(state, path))
+
+
+def _mutation_entry(state: dict, path: str) -> dict:
+    entries = _mutation_entries(state, path)
+    assert entries, f"expected mutation entry for {path!r} in {list(state)}"
+    return entries[0]
+
+
 class TestRecordFileMutationResult:
     def test_non_mutating_tool_ignored(self):
         agent = _bare_agent()
@@ -181,9 +202,9 @@ class TestRecordFileMutationResult:
             result, is_error=True,
         )
         state = agent._turn_failed_file_mutations
-        assert "/tmp/a.md" in state
-        assert state["/tmp/a.md"]["tool"] == "patch"
-        assert "Could not find old_string" in state["/tmp/a.md"]["error_preview"]
+        assert _has_mutation(state, "/tmp/a.md")
+        assert _mutation_entry(state, "/tmp/a.md")["tool"] == "patch"
+        assert "Could not find old_string" in _mutation_entry(state, "/tmp/a.md")["error_preview"]
 
     def test_success_removes_prior_failure(self):
         agent = _bare_agent()
@@ -192,7 +213,7 @@ class TestRecordFileMutationResult:
             "patch", {"mode": "replace", "path": "/tmp/a.md", "old_string": "x", "new_string": "y"},
             json.dumps({"error": "not found"}), is_error=True,
         )
-        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.md")
         # Second attempt with corrected old_string succeeds
         agent._record_file_mutation_result(
             "patch", {"mode": "replace", "path": "/tmp/a.md", "old_string": "real", "new_string": "fixed"},
@@ -223,7 +244,7 @@ class TestRecordFileMutationResult:
             is_error=False,
         )
 
-        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.md")
 
     def test_external_write_after_failure_suppresses_false_footer(self, tmp_path):
         """A non-file tool may recover a failed patch through an official CLI.
@@ -964,7 +985,7 @@ class TestRecordFileMutationResult:
         )
         # Keep the original error — swapping to the latest would obscure
         # the initial root cause.
-        assert "first error" in agent._turn_failed_file_mutations["/tmp/a.md"]["error_preview"]
+        assert "first error" in _mutation_entry(agent._turn_failed_file_mutations, "/tmp/a.md")["error_preview"]
 
     def test_v4a_multi_file_all_tracked(self):
         agent = _bare_agent()

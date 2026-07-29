@@ -17,6 +17,20 @@ from agent.file_mutation_verifier import (
 from run_agent import AIAgent, _extract_file_mutation_targets
 
 
+
+def _record(agent, tool_name, args, result, is_error=True, **kwargs):
+    """Bridge redesign-test kwargs onto the current AIAgent recorder API."""
+    task_id = kwargs.get("effective_task_id") or kwargs.get("task_id") or "default"
+    return _record(
+            agent,
+        tool_name,
+        args,
+        kwargs.get("raw_result", result),
+        is_error,
+        task_id=task_id,
+    )
+
+
 def _bare_agent() -> AIAgent:
     from agent.file_mutation_verifier import TurnFileMutationVerifier
 
@@ -36,7 +50,8 @@ class TestContentTransitionSuppressesFooter:
 
         agent = _bare_agent()
         fail = json.dumps({"success": False, "error": "Write denied (simulated)"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "config.yaml", "old_string": "x", "new_string": "y"},
             fail,
@@ -60,7 +75,8 @@ class TestContentTransitionSuppressesFooter:
 
         agent = _bare_agent()
         fail = json.dumps({"error": "Could not find old_string"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "stale.py", "old_string": "nope", "new_string": "y"},
             fail,
@@ -78,7 +94,8 @@ class TestDispatchTriState:
     def test_not_dispatched_creates_no_ledger_io(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         agent = _bare_agent()
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "write_file",
             {"path": "new.txt", "content": "x"},
             json.dumps({"bytes_written": 1}),
@@ -93,7 +110,8 @@ class TestDispatchTriState:
         (tmp_path / "a.txt").write_text("x\n", encoding="utf-8")
         agent = _bare_agent()
         fail = json.dumps({"error": "first"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "a.txt", "old_string": "x", "new_string": "y"},
             fail,
@@ -101,7 +119,8 @@ class TestDispatchTriState:
             raw_result=fail,
             dispatch=DispatchTriState.DISPATCHED.value,
         )
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "write_file",
             {"path": "a.txt", "content": "landed"},
             json.dumps({"bytes_written": 6}),
@@ -191,7 +210,8 @@ class TestMetadataOnlyChange:
             turn_generation=1,
         )
         fail = json.dumps({"error": "failed"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "meta.py", "old_string": "x", "new_string": "y"},
             fail,
@@ -216,7 +236,8 @@ class TestPathAliasReconciliation:
         target.write_text("start\n", encoding="utf-8")
         agent = _bare_agent()
         fail = json.dumps({"error": "nope"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "alias.py", "old_string": "x", "new_string": "y"},
             fail,
@@ -238,7 +259,8 @@ class TestTurnGenerationBudget:
         agent = _bare_agent()
         agent._file_mutation_verifier.reset_turn(2)
         fail = json.dumps({"error": "late"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "write_file",
             {"path": "z.txt", "content": "a"},
             fail,
@@ -306,7 +328,8 @@ class TestRecoveredThenFailedAgain:
         p.write_text("v1\n", encoding="utf-8")
         agent = _bare_agent()
         fail1 = json.dumps({"error": "first"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "flip.py", "old_string": "v1", "new_string": "v2"},
             fail1,
@@ -321,7 +344,8 @@ class TestRecoveredThenFailedAgain:
         assert agent._turn_failed_file_mutations == {}
 
         fail2 = json.dumps({"error": "second failure"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "flip.py", "old_string": "v9", "new_string": "v3"},
             fail2,
@@ -462,7 +486,8 @@ class TestRegistryDispatchAuthority:
         assert not dispatched
 
         agent = _bare_agent()
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "a.txt", "old_string": "x", "new_string": "y"},
             json.dumps({"error": "first"}),
@@ -470,7 +495,8 @@ class TestRegistryDispatchAuthority:
             raw_result=json.dumps({"error": "first"}),
             dispatch=DispatchTriState.DISPATCHED.value,
         )
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "write_file",
             {"path": "never.txt", "content": "x"},
             json.dumps({"success": True, "bytes_written": 12}),
