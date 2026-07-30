@@ -3163,13 +3163,19 @@ class TestConcurrentToolExecution:
             "write_file",
             {"path": str(actual_target), "content": "after\n"},
         )]
-        assert agent._turn_failed_file_mutations == {}
+        # Middleware-rewritten path is observed; explicit tool error stays unresolved
+        # even when the write partially landed on that path.
+        assert _mutation_state_has_path(
+            agent._turn_failed_file_mutations, actual_target
+        )
         assert not _mutation_state_has_path(
             agent._turn_failed_file_mutations, raw_target
         )
-        assert agent._format_file_mutation_failure_footer(
+        footer = agent._format_file_mutation_failure_footer(
             agent._turn_failed_file_mutations,
-        ) == ""
+        )
+        assert "File-mutation verifier" in footer
+        assert "late failure" in footer
 
     @pytest.mark.parametrize("execution", ["sequential", "concurrent"])
     def test_execution_middleware_short_circuit_preserves_failure(
