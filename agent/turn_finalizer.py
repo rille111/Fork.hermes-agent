@@ -244,25 +244,13 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
-    # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
-
-    # Clean up VM and browser for this task after conversation completes
-    try:
-        agent._cleanup_task_resources(effective_task_id)
-    except Exception as _cleanup_err:
-        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
-        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    _transcript_prepared = True
+    _filled_tool_tail_for_persistence = None
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -331,6 +319,7 @@ def finalize_turn(
                 # candidate collapse — the provisional answer was persisted and
                 # reused as the terminal response, #65919 §7).
                 _tail["content"] = final_response
+                _filled_tool_tail_for_persistence = _tail
                 # The row may have already been flushed to SQLite by the
                 # incremental tool-call persist (conversation_loop.py:4990),
                 # which stamps ``_DB_PERSISTED_MARKER`` so subsequent flushes
@@ -339,7 +328,6 @@ def finalize_turn(
                 # otherwise ``/resume`` reloads ``content=""`` and the bug
                 # resurfaces cross-session.
                 _tail.pop("_db_persisted", None)
-
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
         # final durable snapshot and returning the continuation history. Earlier
@@ -349,10 +337,10 @@ def finalize_turn(
         _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
         if callable(_apply_override):
             _apply_override(messages)
-        agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
+        _transcript_prepared = False
         _cleanup_errors.append(f"persist_session: {_persist_err}")
-        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+        logger.error("finalize_turn: transcript preparation failed: %s", _persist_err, exc_info=True)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -459,15 +447,94 @@ def finalize_turn(
     # If one or more ``write_file`` / ``patch`` calls failed during this
     # turn and were never superseded by a successful write to the same
     # path, append an advisory footer to the assistant response.
+    _failed = {}
+    _mutation_footer = ""
     try:
+        from agent.file_mutation_verifier import sync_legacy_failed_state
+
+        sync_legacy_failed_state(agent)
         _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
         if _failed and agent._file_mutation_verifier_enabled():
             footer = agent._format_file_mutation_failure_footer(_failed)
             if footer:
+                _mutation_footer = str(footer)
                 base = (final_response or "").rstrip()
-                final_response = (base + "\n\n" + footer).strip()
+                final_response = (base + "\n\n" + _mutation_footer).strip()
     except Exception as _ver_err:
         logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+        try:
+            if (
+                (_failed or getattr(agent, "_turn_failed_file_mutations", None))
+                and agent._file_mutation_verifier_enabled()
+            ):
+                from agent.file_mutation_verifier import _GENERIC_FOOTER_FALLBACK
+
+                _mutation_footer = _GENERIC_FOOTER_FALLBACK
+                base = (final_response or "").rstrip()
+                final_response = (
+                    base + "\n\n" + _mutation_footer
+                ).strip()
+        except Exception:
+            pass
+
+    # The completion explainer and output-transform hooks are deliberately
+    # delivery-only, but unresolved file mutations must survive `/resume`.
+    # Persist just that verifier footer without replacing an existing textual
+    # tool-call turn (which is part of the provider transcript contract).
+    # Interrupted turns still deliver the warning live, so durable history must
+    # keep the same safety footer for resume/history consumers.
+    if _mutation_footer:
+        try:
+            _footer_tail = messages[-1] if messages else None
+        except Exception:
+            _footer_tail = None
+        if not isinstance(_footer_tail, dict) or _footer_tail.get("role") != "assistant":
+            messages.append({"role": "assistant", "content": _mutation_footer})
+        elif (
+            not _footer_tail.get("tool_calls")
+            or _footer_tail is _filled_tool_tail_for_persistence
+            or interrupted
+        ):
+            _footer_content = _footer_tail.get("content")
+            if isinstance(_footer_content, str) or _footer_content is None:
+                _footer_base = (_footer_content or "").rstrip()
+                if not _footer_base.endswith(_mutation_footer):
+                    _footer_tail["content"] = (
+                        (_footer_base + "\n\n" + _mutation_footer).strip()
+                        if _footer_base
+                        else _mutation_footer
+                    )
+                    _footer_tail.pop("_db_persisted", None)
+            elif interrupted:
+                # Non-string assistant content on interrupt: append a dedicated
+                # footer row rather than mutating multimodal structure.
+                messages.append({"role": "assistant", "content": _mutation_footer})
+
+    # Save trajectory if enabled. ``user_message`` may be a multimodal list of
+    # parts; the trajectory format wants a plain string.
+    try:
+        agent._save_trajectory(
+            messages,
+            _summarize_user_message_for_log(user_message),
+            completed,
+        )
+    except Exception as _save_err:
+        _cleanup_errors.append(f"save_trajectory: {_save_err}")
+        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+
+    # Clean up VM and browser for this task after conversation completes.
+    try:
+        agent._cleanup_task_resources(effective_task_id)
+    except Exception as _cleanup_err:
+        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
+        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
+
+    if _transcript_prepared:
+        try:
+            agent._persist_session(messages, conversation_history)
+        except Exception as _persist_err:
+            _cleanup_errors.append(f"persist_session: {_persist_err}")
+            logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
     _response_transformed = False
 
@@ -492,6 +559,16 @@ def finalize_turn(
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+
+    # Mutation-integrity warnings are safety output, not transformable model
+    # prose. A plugin may replace the answer, but it must not erase the warning
+    # that a structured edit reported failure.
+    if _mutation_footer:
+        _visible_base = (final_response or "").rstrip()
+        if not _visible_base.endswith(_mutation_footer):
+            final_response = (
+                _visible_base + "\n\n" + _mutation_footer
+            ).strip()
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
@@ -601,6 +678,15 @@ def finalize_turn(
     # (the response is still returned either way — #8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
+    try:
+        from agent.file_mutation_verifier import get_verifier
+
+        _verifier = get_verifier(agent)
+        if _verifier is not None:
+            _verifier.clear_turn()
+        agent._file_mutation_verifier = None
+    except Exception:
+        pass
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.

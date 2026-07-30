@@ -1824,6 +1824,45 @@ class CLICommandsMixin:
         else:  # pragma: no cover - defensive (no live input loop)
             print("  /init needs an active chat session to run.")
 
+    def _handle_delete_project_command(self, cmd: str) -> None:
+        """Queue a guarded agent turn for /delete-project."""
+        parts = cmd.strip().split(None, 1)
+        target_info = parts[1].strip() if len(parts) > 1 else ""
+
+        if not target_info:
+            try:
+                from hermes_cli import projects_db as pdb
+
+                conn = pdb.connect()
+                try:
+                    active_id = pdb.get_active_id(conn)
+                    project = pdb.get_project(conn, active_id) if active_id else None
+                    if not project:
+                        project = pdb.project_for_path(conn, os.getcwd())
+                    if project:
+                        target_info = (
+                            f"'{project.name}' (slug: {project.slug}, id: {project.id}, "
+                            f"folders: {[folder.path for folder in project.folders]})"
+                        )
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        if not target_info:
+            target_info = f"the project in directory: {os.getcwd()}"
+
+        prompt = (
+            f"The user ran /delete-project to delete {target_info}. "
+            "Please inspect the project details (folders, files, projects.db entry, active/past sessions), "
+            "clearly list everything that will be deleted to the user, and ask the user for explicit confirmation before deleting anything. "
+            "Upon receiving explicit confirmation from the user, proceed to delete all project files/directories, remove the project from projects.db, and clean up any associated project metadata."
+        )
+        if hasattr(self, "_pending_input"):
+            self._pending_input.put(prompt)
+        else:  # pragma: no cover - defensive (no live input loop)
+            print("  /delete-project needs an active chat session to run.")
+
     def _handle_memory_command(self, cmd: str):
         """Handle /memory slash command — pending review + approval-gate toggle."""
         from hermes_cli.write_approval_commands import handle_pending_subcommand

@@ -5,8 +5,8 @@ import type { ProjectInfo, SessionInfo } from '@/types/hermes'
 
 import {
   baseName,
-  isBranchTargetLane,
   excludeProjectSessions,
+  isBranchTargetLane,
   kanbanWorktreeDir,
   liveSessionProjectId,
   mergeRepoWorktreeGroups,
@@ -731,10 +731,7 @@ describe('overlayLiveLanes', () => {
     const repo = overlaid.repos[0]
 
     expect(repo.gitKind).toBe('git')
-    expect(repo.groups.map(group => group.id)).toEqual([
-      '/repo::branch::main',
-      '/repo::branch::feature/fresh'
-    ])
+    expect(repo.groups.map(group => group.id)).toEqual(['/repo::branch::main', '/repo::branch::feature/fresh'])
     expect(repo.groups.some(group => group.id === '/repo')).toBe(false)
   })
 

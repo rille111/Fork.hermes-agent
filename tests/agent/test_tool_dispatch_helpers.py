@@ -371,7 +371,11 @@ class TestFileMutationTargets:
                     "***" " Begin Patch\n"
                     "***" " Move File: first-old.py -> first-new.py\n"
                     "***" " Update File: middle.py\n"
+                    " middle context\n"
+                    "-old middle\n"
+                    "+new middle\n"
                     "***" " Add File: added.py\n"
+                    "+added content\n"
                     "***" " Move File: last-old.py -> last-new.py\n"
                     "***" " End Patch\n"
                 ),

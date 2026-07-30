@@ -49,6 +49,22 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
+def _mutation_state_has_path(state: dict, path: Path | str) -> bool:
+    display_path = str(path)
+    return any(
+        key == display_path or info.get("_display_path") == display_path
+        for key, info in state.items()
+    )
+
+
+def _complete_observed_dispatch(kwargs: dict, args: dict, result: str) -> str:
+    observed = kwargs.get("observed_dispatch_out")
+    if observed is not None:
+        observed["args"] = dict(args)
+        observed["result"] = result
+    return result
+
+
 def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
@@ -206,6 +222,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.entered.set()
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
+
+        def flush_token_counts(self):
+            pass
 
     db = _BarrierDB()
     agent._session_db = db
@@ -2728,8 +2747,8 @@ class TestConcurrentToolExecution:
                 mock_seq.assert_called_once()
                 mock_con.assert_not_called()
 
-    def test_disjoint_write_batch_uses_concurrent_path(self, agent):
-        """Independent file writes should still run concurrently."""
+    def test_disjoint_write_batch_uses_sequential_path(self, agent):
+        """Middleware can rewrite disjoint writes onto one target."""
         tc1 = _mock_tool_call(
             name="write_file",
             arguments='{"path":"src/a.py","content":"print(1)"}',
@@ -2745,8 +2764,8 @@ class TestConcurrentToolExecution:
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
             with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
-                mock_con.assert_called_once()
-                mock_seq.assert_not_called()
+                mock_seq.assert_called_once()
+                mock_con.assert_not_called()
 
     def test_overlapping_write_batch_forces_sequential(self, agent):
         """Writes to the same file must stay ordered."""
@@ -2779,6 +2798,47 @@ class TestConcurrentToolExecution:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
                 mock_seq.assert_called_once()
                 mock_con.assert_not_called()
+
+    def test_direct_concurrent_rechecks_tool_search_mutation_after_unwrap(self, agent):
+        """Tool Search must not hide a structured mutation from the worker barrier."""
+        bridge_call = _mock_tool_call(
+            name="tool_call",
+            arguments=json.dumps({
+                "name": "write_file",
+                "arguments": {"path": "x.txt", "content": "updated"},
+            }),
+            call_id="bridge-write",
+        )
+        read_call = _mock_tool_call(
+            name="read_file",
+            arguments='{"path":"x.txt"}',
+            call_id="read-after-write",
+        )
+        message = _mock_assistant_msg(
+            content="",
+            tool_calls=[bridge_call, read_call],
+        )
+
+        with (
+            patch(
+                "tools.tool_search.resolve_underlying_call",
+                return_value=(
+                    "write_file",
+                    {"path": "x.txt", "content": "updated"},
+                    None,
+                ),
+            ),
+            patch(
+                "agent.tool_executor._tool_search_scoped_names",
+                return_value={"write_file"},
+            ),
+            patch(
+                "agent.tool_executor.execute_tool_calls_sequential"
+            ) as sequential,
+        ):
+            agent._execute_tool_calls_concurrent(message, [], "task-1")
+
+        sequential.assert_called_once()
 
     def test_none_args_batch_does_not_crash_parallelism_gating(self, agent):
         """Non-string tool arguments must not crash the segment planner —
@@ -2857,6 +2917,9 @@ class TestConcurrentToolExecution:
         tmp_path,
         monkeypatch,
     ):
+        monkeypatch.setattr(
+            "agent.tool_executor.FILE_MUTATING_TOOL_NAMES", frozenset()
+        )
         target = tmp_path / "config.yaml"
         target.write_text("before\n", encoding="utf-8")
         agent._turn_failed_file_mutations = {}
@@ -2899,12 +2962,17 @@ class TestConcurrentToolExecution:
 
         def fake_handle(name, args, task_id, **kwargs):
             if name == "patch":
-                return json.dumps({
+                result = json.dumps({
                     "error": "protected config; use hermes config set",
                 })
+                return _complete_observed_dispatch(kwargs, args, result)
             assert snapshot_captured.wait(2.0)
             target.write_text("after\n", encoding="utf-8")
-            return json.dumps({"ok": True})
+            return _complete_observed_dispatch(
+                kwargs,
+                args,
+                json.dumps({"ok": True}),
+            )
 
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
@@ -2917,8 +2985,12 @@ class TestConcurrentToolExecution:
         self,
         agent,
         tmp_path,
+        monkeypatch,
     ):
         """Middleware can make nominally independent calls share a target."""
+        monkeypatch.setattr(
+            "agent.tool_executor.FILE_MUTATING_TOOL_NAMES", frozenset()
+        )
         target = tmp_path / "shared.txt"
         target.write_text("before\n", encoding="utf-8")
         agent._turn_failed_file_mutations = {}
@@ -2949,12 +3021,21 @@ class TestConcurrentToolExecution:
         messages = []
 
         def fake_handle(_name, _args, _task_id, **kwargs):
+            observed = kwargs.get("observed_dispatch_out")
+            if observed is not None:
+                observed["args"] = dict(_args)
             if kwargs["tool_call_id"] == "c-success":
                 target.write_text("after\n", encoding="utf-8")
                 success_landed.set()
-                return json.dumps({"success": True})
+                result = json.dumps({"success": True})
+                if observed is not None:
+                    observed["result"] = result
+                return result
             assert success_landed.wait(2.0)
-            return json.dumps({"error": "late failure"})
+            result = json.dumps({"error": "late failure"})
+            if observed is not None:
+                observed["result"] = result
+            return result
 
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
@@ -2965,7 +3046,7 @@ class TestConcurrentToolExecution:
             "c-failure",
             "c-success",
         ]
-        assert str(target) in agent._turn_failed_file_mutations
+        assert _mutation_state_has_path(agent._turn_failed_file_mutations, target)
         # The ledger retains the later failure for unconfirmable backends, but
         # the local footer sees that content changed after the pre-batch
         # baseline even though the recovery sibling returned first.
@@ -2977,7 +3058,11 @@ class TestConcurrentToolExecution:
         self,
         agent,
         tmp_path,
+        monkeypatch,
     ):
+        monkeypatch.setattr(
+            "agent.tool_executor.FILE_MUTATING_TOOL_NAMES", frozenset()
+        )
         raw_target = tmp_path / "raw.txt"
         actual_target = tmp_path / "middleware-target.txt"
         actual_target.write_text("before\n", encoding="utf-8")
@@ -2998,6 +3083,13 @@ class TestConcurrentToolExecution:
         def rewrite_target(_name, args, next_call, **_context):
             return next_call({**args, "path": str(actual_target)})
 
+        def failed_dispatch(_name, args, _task_id, **kwargs):
+            return _complete_observed_dispatch(
+                kwargs,
+                args,
+                json.dumps({"error": "replacement not found"}),
+            )
+
         with (
             patch(
                 "hermes_cli.middleware.run_tool_execution_middleware",
@@ -3005,7 +3097,7 @@ class TestConcurrentToolExecution:
             ),
             patch(
                 "run_agent.handle_function_call",
-                return_value=json.dumps({"error": "replacement not found"}),
+                side_effect=failed_dispatch,
             ),
         ):
             agent._execute_tool_calls_concurrent(
@@ -3014,8 +3106,12 @@ class TestConcurrentToolExecution:
                 "task-1",
             )
 
-        assert str(actual_target) in agent._turn_failed_file_mutations
-        assert str(raw_target) not in agent._turn_failed_file_mutations
+        assert _mutation_state_has_path(
+            agent._turn_failed_file_mutations, actual_target
+        )
+        assert not _mutation_state_has_path(
+            agent._turn_failed_file_mutations, raw_target
+        )
 
     def test_sequential_verifier_uses_execution_middleware_target_and_baseline(
         self,
@@ -3028,6 +3124,10 @@ class TestConcurrentToolExecution:
         agent._turn_failed_file_mutations = {}
         agent._turn_file_mutation_paths = set()
         agent._turn_file_mutation_snapshot_budget = None
+        from agent.file_mutation_verifier import TurnFileMutationVerifier
+
+        agent._file_mutation_verifier = TurnFileMutationVerifier()
+        agent._file_mutation_verifier.reset_turn(1)
         tc = _mock_tool_call(
             name="write_file",
             arguments=json.dumps({
@@ -3063,8 +3163,10 @@ class TestConcurrentToolExecution:
             "write_file",
             {"path": str(actual_target), "content": "after\n"},
         )]
-        assert str(actual_target) in agent._turn_failed_file_mutations
-        assert str(raw_target) not in agent._turn_failed_file_mutations
+        assert agent._turn_failed_file_mutations == {}
+        assert not _mutation_state_has_path(
+            agent._turn_failed_file_mutations, raw_target
+        )
         assert agent._format_file_mutation_failure_footer(
             agent._turn_failed_file_mutations,
         ) == ""
@@ -3075,12 +3177,21 @@ class TestConcurrentToolExecution:
         agent,
         tmp_path,
         execution,
+        monkeypatch,
     ):
+        if execution == "concurrent":
+            monkeypatch.setattr(
+                "agent.tool_executor.FILE_MUTATING_TOOL_NAMES", frozenset()
+            )
         target = tmp_path / "target.txt"
         target.write_text("before\n", encoding="utf-8")
         agent.valid_tool_names = set(agent.valid_tool_names) | {"write_file"}
         agent._turn_failed_file_mutations = {}
         agent._turn_file_mutation_paths = set()
+        from agent.file_mutation_verifier import TurnFileMutationVerifier
+
+        agent._file_mutation_verifier = TurnFileMutationVerifier()
+        agent._file_mutation_verifier.reset_turn(1)
         agent._record_file_mutation_result(
             "write_file",
             {"path": str(target), "content": "old"},
@@ -3111,7 +3222,7 @@ class TestConcurrentToolExecution:
             )
 
         dispatch.assert_not_called()
-        assert str(target) in agent._turn_failed_file_mutations
+        assert _mutation_state_has_path(agent._turn_failed_file_mutations, target)
 
     def test_direct_concurrent_file_mutations_are_serialized(self, agent, tmp_path):
         agent.valid_tool_names = set(agent.valid_tool_names) | {"write_file"}
@@ -3235,13 +3346,22 @@ class TestConcurrentToolExecution:
         agent,
         tmp_path,
         execution,
+        monkeypatch,
     ):
+        if execution == "concurrent":
+            monkeypatch.setattr(
+                "agent.tool_executor.FILE_MUTATING_TOOL_NAMES", frozenset()
+            )
         target = tmp_path / f"{execution}-target.txt"
         target.write_text("before\n", encoding="utf-8")
         agent.valid_tool_names = set(agent.valid_tool_names) | {"patch"}
         agent._turn_failed_file_mutations = {}
         agent._turn_file_mutation_paths = set()
         agent._turn_file_mutation_snapshot_budget = None
+        from agent.file_mutation_verifier import TurnFileMutationVerifier
+
+        agent._file_mutation_verifier = TurnFileMutationVerifier()
+        agent._file_mutation_verifier.reset_turn(1)
         tc = _mock_tool_call(
             name="patch",
             arguments=json.dumps({
@@ -3253,20 +3373,38 @@ class TestConcurrentToolExecution:
             call_id=f"c-{execution}-raw-result",
         )
 
-        def transformed_handle(_name, args, _task_id, **kwargs):
-            observed = kwargs["observed_dispatch_out"]
-            observed["args"] = dict(args)
-            observed["result"] = json.dumps({"error": "replacement not found"})
-            return json.dumps({"success": True})
+        raw_failure = json.dumps({"error": "replacement not found"})
+        visible_success = json.dumps({"success": True})
 
-        with patch("run_agent.handle_function_call", side_effect=transformed_handle):
+        def call_execution(_name, args, next_call, **_context):
+            return next_call(args)
+
+        def has_hook(name):
+            return name == "transform_tool_result"
+
+        def invoke_hook(name, **_kwargs):
+            assert name == "transform_tool_result"
+            return [visible_success]
+
+        messages = []
+
+        with (
+            patch("model_tools.registry.dispatch", return_value=raw_failure),
+            patch(
+                "hermes_cli.middleware.run_tool_execution_middleware",
+                side_effect=call_execution,
+            ),
+            patch("hermes_cli.lifecycle.has_hook", side_effect=has_hook),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=invoke_hook),
+        ):
             getattr(agent, f"_execute_tool_calls_{execution}")(
                 _mock_assistant_msg(content="", tool_calls=[tc]),
-                [],
+                messages,
                 "task-1",
             )
 
-        assert str(target) in agent._turn_failed_file_mutations
+        assert json.loads(messages[0]["content"]) == {"success": True}
+        assert _mutation_state_has_path(agent._turn_failed_file_mutations, target)
 
     def test_concurrent_none_args_rejected_without_crash(self, agent):
         """Concurrent executor must not crash on arguments=None. Current
@@ -3380,7 +3518,11 @@ class TestConcurrentToolExecution:
         self,
         agent,
         tmp_path,
+        monkeypatch,
     ):
+        monkeypatch.setattr(
+            "agent.tool_executor.FILE_MUTATING_TOOL_NAMES", frozenset()
+        )
         class ShutdownExecutor:
             def __init__(self, *args, **kwargs):
                 pass
@@ -3419,6 +3561,9 @@ class TestConcurrentToolExecution:
         monkeypatch,
         tmp_path,
     ):
+        monkeypatch.setattr(
+            "agent.tool_executor.FILE_MUTATING_TOOL_NAMES", frozenset()
+        )
         monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
         blocker = threading.Event()
         mutation_started = threading.Event()
@@ -3514,6 +3659,9 @@ class TestConcurrentToolExecution:
         """A missing first result must not reuse an uninitialised/stale status."""
         import threading
 
+        monkeypatch.setattr(
+            "agent.tool_executor.FILE_MUTATING_TOOL_NAMES", frozenset()
+        )
         monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
         blocker = threading.Event()
         target = tmp_path / "config.yaml"
@@ -3539,11 +3687,18 @@ class TestConcurrentToolExecution:
         agent._turn_file_mutation_paths = set()
         agent._turn_file_mutation_snapshot_budget = None
 
-        def fake_handle(name, _args, _task_id, **_kwargs):
+        def fake_handle(name, _args, _task_id, **kwargs):
+            observed = kwargs.get("observed_dispatch_out")
+            if observed is not None:
+                observed["args"] = dict(_args)
             if name == "patch":
                 blocker.wait(timeout=5)
-                return json.dumps({"error": "late failure"})
-            return "fast-result"
+                result = json.dumps({"error": "late failure"})
+            else:
+                result = "fast-result"
+            if observed is not None:
+                observed["result"] = result
+            return result
 
         try:
             with patch("run_agent.handle_function_call", side_effect=fake_handle):
@@ -3554,7 +3709,7 @@ class TestConcurrentToolExecution:
         assert len(messages) == 2
         assert "timed out after" in messages[0]["content"]
         assert messages[0]["effect_disposition"] == "unknown"
-        assert str(target) in agent._turn_failed_file_mutations
+        assert _mutation_state_has_path(agent._turn_failed_file_mutations, target)
 
     def test_concurrent_timeout_prefers_late_real_result_over_timeout_message(self, agent, monkeypatch):
         """A worker that finishes in the window between the deadline snapshot
@@ -5463,7 +5618,8 @@ class TestRunConversation:
         # #34452: the bare "(empty)" sentinel is now replaced by a
         # user-visible end-of-turn explanation so the failure isn't silent.
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
+        assert "only internal reasoning" in result["final_response"]
+        assert "reasoning only" in result["final_response"]
         assert result["turn_exit_reason"] == "empty_response_exhausted"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
@@ -5486,7 +5642,8 @@ class TestRunConversation:
         assert result["completed"] is True
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
+        assert "only internal reasoning" in result["final_response"]
+        assert "structured reasoning answer" in result["final_response"]
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):

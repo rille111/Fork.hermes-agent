@@ -589,10 +589,10 @@ class TestShellFileOpsHelpers:
 
     def test_read_file_strips_leaked_terminal_fence_markers(self, mock_env):
         leaked = (
-            "'\x07__HERMES_FENCE_a9f7b3__\x1b]0;cat "
+            "'\x07\x1b]0;cat "
             "'/tmp/test/a.py' 2> /dev/null\x07\n"
             "print('ok')\n"
-            "__HERMES_FENCE_a9f7b3__\x07'\n"
+            "\x07'\n"
         )
 
         def side_effect(command, **kwargs):
@@ -618,9 +618,9 @@ class TestShellFileOpsHelpers:
 
     def test_read_file_raw_strips_leaked_terminal_fence_markers(self, mock_env):
         leaked = (
-            "__HERMES_FENCE_a9f7b3__\x07'\n"
+            "\x07'\n"
             "alpha\n"
-            "\x1b]0;cat '/tmp/test/a.txt'\x07__HERMES_FENCE_a9f7b3__\n"
+            "\x1b]0;cat '/tmp/test/a.txt'\x07\n"
         )
 
         def side_effect(command, **kwargs):
@@ -729,11 +729,14 @@ class TestSearchFilesFallbackHiddenPaths:
         env.cwd = "/"
 
         def execute(command, **kwargs):
+            from tools.environments.local import _find_bash
+
             completed = subprocess.run(
-                command,
-                shell=True,
+                [_find_bash(), "-c", command],
                 text=True,
                 capture_output=True,
+                encoding="utf-8",
+                errors="replace",
             )
             return {
                 "output": completed.stdout,

@@ -15,35 +15,26 @@ export function Backdrop() {
   }
 
   return (
-    <>
-      <Leva collapsed hidden={!import.meta.env.DEV || !controlsOpen} titleBar={{ title: 'backdrop', drag: true }} />
-
-      {(on || chandra) && statue.enabled && (
-        <div
-          aria-hidden
-          className="pointer-events-none absolute inset-0 z-2"
-          data-chandra-backdrop={chandra ? '' : undefined}
-          style={{
-            mixBlendMode: (chandra ? 'normal' : statue.blendMode) as CSSProperties['mixBlendMode'],
-            opacity: chandra ? 0.34 : statue.opacity
-          }}
-        >
-          <img
-            alt=""
-            className={chandra ? 'h-dvh w-full object-cover' : 'w-auto min-w-dvw object-cover'}
-            fetchPriority="low"
-            src={assetPath('ds-assets/filler-bg0.jpg')}
-            style={{
-              height: chandra ? '100dvh' : `${statue.scale}dvh`,
-              objectPosition: chandra ? 'center center' : statue.objectPosition,
-              filter: chandra
-                ? 'saturate(1.08) brightness(0.82) contrast(1.08)'
-                : `invert(calc(${statue.invert ? 1 : 0} * var(--backdrop-invert-mul, 1))) saturate(${statue.saturate}) brightness(${statue.brightness})`
-            }}
-          />
-          {chandra && <div className="chandra-backdrop-scrim absolute inset-0" />}
-        </div>
-      )}
-    </>
+    <div
+      aria-hidden
+      className={
+        chandra
+          ? 'pointer-events-none absolute inset-0 z-2 opacity-[0.34]'
+          : 'pointer-events-none absolute inset-0 z-2 opacity-[0.025] mix-blend-difference'
+      }
+      data-chandra-backdrop={chandra ? '' : undefined}
+    >
+      <img
+        alt=""
+        className={
+          chandra
+            ? 'h-dvh w-full object-cover object-center [filter:saturate(1.08)_brightness(0.82)_contrast(1.08)]'
+            : 'h-[160dvh] w-auto min-w-dvw object-cover object-left-top [filter:invert(var(--backdrop-invert-mul,1))]'
+        }
+        fetchPriority="low"
+        src={assetPath('ds-assets/filler-bg0.jpg')}
+      />
+      {chandra && <div className="chandra-backdrop-scrim absolute inset-0" />}
+    </div>
   )
 }

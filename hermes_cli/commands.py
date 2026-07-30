@@ -175,8 +175,17 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]"),
 
-    # Configuration
+    # Session
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
+
+    # Project
+    CommandDef(
+        "delete-project",
+        "Delete everything related to a project",
+        "Project",
+        aliases=("deleteproject", "rmproject"),
+        args_hint="[project_name_or_slug]",
+    ),
 
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from queue import Queue
+
+from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.commands import COMMAND_REGISTRY, resolve_command
 
 
@@ -29,4 +32,18 @@ def test_tui_gateway_pending_commands():
     assert "delete-project" in _PENDING_INPUT_COMMANDS
     assert "deleteproject" in _PENDING_INPUT_COMMANDS
     assert "rmproject" in _PENDING_INPUT_COMMANDS
+
+
+def test_cli_handler_queues_delete_confirmation_prompt():
+    class DummyCLI(CLICommandsMixin):
+        pass
+
+    cli = DummyCLI()
+    cli._pending_input = Queue()
+
+    cli._handle_delete_project_command("/delete-project demo")
+
+    prompt = cli._pending_input.get_nowait()
+    assert "delete demo" in prompt
+    assert "ask the user for explicit confirmation" in prompt
 

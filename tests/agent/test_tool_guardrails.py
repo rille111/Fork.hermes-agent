@@ -1,6 +1,9 @@
 """Pure tool-call guardrail primitive tests."""
 
+from __future__ import annotations
+
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -321,6 +324,27 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
+
+
+def test_concurrent_web_searches_respect_cap_atomically():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            loop_caps=LoopCapConfig(max_web_searches=7, max_subagents=0)
+        )
+    )
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        decisions = list(
+            pool.map(
+                lambda index: controller.before_call(
+                    "web_search", {"query": f"q-{index}"}
+                ),
+                range(64),
+            )
+        )
+
+    assert sum(decision.allows_execution for decision in decisions) == 7
+    assert sum(decision.code == "loop_web_search_cap" for decision in decisions) == 57
 
 
 def test_web_search_cap_resets_each_turn():

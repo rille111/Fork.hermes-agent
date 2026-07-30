@@ -3178,8 +3178,9 @@ def _termux_example_image_path(filename: str = "cat.png") -> str:
     ]
     for root in candidates:
         if os.path.isdir(root):
-            return os.path.join(root, "Pictures", filename)
-    return os.path.join("~/storage/shared", "Pictures", filename)
+            normalized_root = root.replace("\\", "/").rstrip("/")
+            return f"{normalized_root}/Pictures/{filename}"
+    return f"~/storage/shared/Pictures/{filename}"
 
 
 def _split_path_input(raw: str) -> tuple[str, str]:
@@ -3252,7 +3253,12 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
                     expanded = f"//{parsed.netloc}{expanded}"
         except Exception:
             expanded = token
-    expanded = os.path.expandvars(os.path.expanduser(expanded))
+    expanded = os.path.expandvars(expanded)
+    if expanded == "~" or expanded.startswith(("~/", "~\\")):
+        home = os.getenv("HOME") or os.path.expanduser("~")
+        expanded = home + expanded[1:]
+    else:
+        expanded = os.path.expanduser(expanded)
     if os.name != "nt":
         normalized = expanded.replace("\\", "/")
         if len(normalized) >= 3 and normalized[1] == ":" and normalized[2] == "/" and normalized[0].isalpha():

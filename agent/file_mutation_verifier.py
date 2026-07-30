@@ -88,6 +88,14 @@ class ContentFingerprint:
     inode: int
 
 
+_MISSING_CONTENT_FINGERPRINT = ContentFingerprint(
+    size=-1,
+    digest=hashlib.sha256(b"hermes:file-mutation-target-missing").digest(),
+    mtime_ns=-1,
+    inode=-1,
+)
+
+
 @dataclass
 class LedgerEntry:
     identity: MutationIdentity
@@ -153,7 +161,15 @@ class TurnFileMutationVerifier:
                 scope,
                 turn_generation=turn_generation,
             )
-            self._pre_dispatch_baselines[(scope, raw_path)] = fp
+            with self._lock:
+                expected_generation = (
+                    turn_generation
+                    if turn_generation is not None
+                    else self._budget.generation
+                )
+                if self._budget.generation != expected_generation:
+                    return
+                self._pre_dispatch_baselines[(scope, raw_path)] = fp
 
     def clear_turn(self) -> None:
         self.reset_turn(0)
@@ -210,13 +226,23 @@ class TurnFileMutationVerifier:
 
         if dispatch is DispatchTriState.DISPATCHED_NO_RESULT:
             preview = "tool dispatch finished without a result"
+            scope = effective_task_id or "default"
             for raw_path in targets:
+                # Unknown results have the same partial-effect risk as explicit
+                # failures. Anchor the warning after dispatch; otherwise a
+                # write that landed before losing its result clears itself.
+                self._pre_dispatch_baselines.pop((scope, raw_path), None)
+                baseline = self._capture_baseline(
+                    raw_path,
+                    scope,
+                    turn_generation=turn_generation,
+                )
                 self._upsert_unresolved(
                     tool_name=tool_name,
                     raw_path=raw_path,
                     task_id=effective_task_id,
                     error_preview=preview,
-                    baseline=None,
+                    baseline=baseline,
                 )
             return
 
@@ -238,13 +264,17 @@ class TurnFileMutationVerifier:
             preview = _extract_error_preview(raw_result)
             scope = effective_task_id or "default"
             for raw_path in targets:
-                baseline = self._pre_dispatch_baselines.pop((scope, raw_path), None)
-                if baseline is None:
-                    baseline = self._capture_baseline(
-                        raw_path,
-                        scope,
-                        turn_generation=turn_generation,
-                    )
+                # An explicit failure may still have partially changed the
+                # target before returning its error. Reconcile from the state
+                # observed *after* that failed dispatch, so the operation's own
+                # partial effect cannot erase its warning. Only a later content
+                # transition may clear it.
+                self._pre_dispatch_baselines.pop((scope, raw_path), None)
+                baseline = self._capture_baseline(
+                    raw_path,
+                    scope,
+                    turn_generation=turn_generation,
+                )
                 self._upsert_unresolved(
                     tool_name=tool_name,
                     raw_path=raw_path,
@@ -287,7 +317,7 @@ class TurnFileMutationVerifier:
             current = self._capture_baseline(sample_path, sample_scope)
             if current is None:
                 continue
-            if current.digest != baseline.digest:
+            if (current.size, current.digest) != (baseline.size, baseline.digest):
                 to_remove.extend(k for k, _ in items)
         for key in to_remove:
             self._ledger.pop(key, None)
@@ -332,6 +362,12 @@ class TurnFileMutationVerifier:
                 return
             existing = self._ledger.get(key)
             if existing is not None and existing.unresolved:
+                # A later attempt starts from a later filesystem state. Refresh
+                # the baseline and diagnostic so reconciliation cannot clear the
+                # new failure merely because the file changed after an older one.
+                existing.tool = tool_name
+                existing.error_preview = error_preview
+                existing.baseline = baseline
                 return
             self._ledger[key] = LedgerEntry(
                 identity=ident,
@@ -370,20 +406,34 @@ class TurnFileMutationVerifier:
         *,
         turn_generation: Optional[int] = None,
     ) -> Optional[ContentFingerprint]:
-        if turn_generation is not None and turn_generation != self._budget.generation:
-            return None
+        with self._lock:
+            expected_generation = (
+                turn_generation
+                if turn_generation is not None
+                else self._budget.generation
+            )
+            if self._budget.generation != expected_generation:
+                return None
         ident = self._identity_for_path(raw_path, task_id)
         if ident is None or ident.backend_kind != "local":
             return None
         if not _path_allowed_for_observation(ident.path):
             return None
         with self._lock:
+            if self._budget.generation != expected_generation:
+                return None
             if self._budget.snapshot_attempts >= MAX_SNAPSHOT_ATTEMPTS:
                 self._budget.overflow = True
                 return None
             self._budget.snapshot_attempts += 1
         resolved = _resolve_local_path(raw_path, task_id)
         if resolved is None:
+            return None
+        try:
+            resolved.lstat()
+        except FileNotFoundError:
+            return _MISSING_CONTENT_FINGERPRINT
+        except OSError:
             return None
         fp, read_bytes = _stable_local_fingerprint(
             resolved,
@@ -393,6 +443,8 @@ class TurnFileMutationVerifier:
             pid_lock=self._lock,
         )
         with self._lock:
+            if self._budget.generation != expected_generation:
+                return None
             self._budget.snapshot_bytes += read_bytes
             if self._budget.snapshot_bytes > MAX_SNAPSHOT_BYTES:
                 self._budget.overflow = True
@@ -418,16 +470,37 @@ def _default_resolve_backend(task_id: str) -> Tuple[str, str, str]:
         env = get_active_env(task_id)
     except Exception:
         env = None
-    if env is None:
+    if env is not None:
+        cls = type(env).__name__
+        if cls == "LocalEnvironment":
+            return "local", "host", _path_dialect()
+        if "SSH" in cls:
+            return "ssh", cls, "posix"
+        if (
+            "Docker" in cls
+            or "Singularity" in cls
+            or "Modal" in cls
+            or "Daytona" in cls
+        ):
+            return "container", cls, "posix"
+        return "unknown", cls, "unknown"
+
+    # File environments are created lazily inside registry dispatch. Consult
+    # the configured backend before the first call so a not-yet-created SSH or
+    # container environment is never mistaken for the controller host.
+    try:
+        from tools.file_tools import _terminal_env_type_for_task_strict
+
+        env_type = _terminal_env_type_for_task_strict(task_id)
+    except Exception:
+        env_type = "unknown"
+    if env_type == "local":
         return "local", "host", _path_dialect()
-    cls = type(env).__name__
-    if cls == "LocalEnvironment":
-        return "local", "host", _path_dialect()
-    if "SSH" in cls:
-        return "ssh", cls, "posix"
-    if "Docker" in cls or "Singularity" in cls or "Modal" in cls or "Daytona" in cls:
-        return "container", cls, "posix"
-    return "unknown", cls, "unknown"
+    if env_type == "ssh":
+        return "ssh", "configured:ssh", "posix"
+    if env_type in {"docker", "singularity", "modal", "daytona"}:
+        return "container", f"configured:{env_type}", "posix"
+    return "unknown", f"configured:{env_type}", "unknown"
 
 
 def _path_dialect() -> str:

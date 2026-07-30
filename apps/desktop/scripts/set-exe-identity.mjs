@@ -40,9 +40,10 @@ import { existsSync } from 'node:fs'
 
 import { rcedit } from 'rcedit'
 
+import DESKTOP_PACKAGE from '../package.json' with { type: 'json' }
 import { isMain } from './utils.mjs'
 
-function resolveProductIdentity(env = process.env) {
+function resolveProductIdentity(env = process.env, version = DESKTOP_PACKAGE.version) {
   const configuredName =
     'HERMES_DESKTOP_APP_NAME' in env ? env.HERMES_DESKTOP_APP_NAME : env.KUMO_DESKTOP_APP_NAME
   const productName = configuredName?.trim() || 'Hermes'
@@ -56,7 +57,22 @@ function resolveProductIdentity(env = process.env) {
     env.KUMO_DESKTOP_LEGAL_COPYRIGHT?.trim() ||
     `Copyright (c) 2026 ${companyName}`
 
-  return { companyName, legalCopyright, productName }
+  return { companyName, legalCopyright, productName, version }
+}
+
+function buildRceditOptions(identity, icon) {
+  const { companyName, legalCopyright, productName, version } = identity
+  return {
+    icon,
+    'file-version': version,
+    'product-version': version,
+    'version-string': {
+      ProductName: productName,
+      FileDescription: productName,
+      CompanyName: companyName,
+      LegalCopyright: legalCopyright
+    }
+  }
 }
 
 // Stamp the Hermes icon + identity onto `exe`. Resolves on success, throws on
@@ -76,22 +92,14 @@ async function stampExeIdentity(exe, desktopRoot = resolve(import.meta.dirname, 
   console.log(`[set-exe-identity] stamping ${exe}`)
   console.log(`[set-exe-identity] icon: ${icon}`)
 
-  const { companyName, legalCopyright, productName } = resolveProductIdentity()
+  const identity = resolveProductIdentity()
 
-  await rcedit(exe, {
-    icon,
-    'version-string': {
-      ProductName: productName,
-      FileDescription: productName,
-      CompanyName: companyName,
-      LegalCopyright: legalCopyright
-    }
-  })
+  await rcedit(exe, buildRceditOptions(identity, icon))
 
-  console.log(`[set-exe-identity] done — ${productName} icon + identity stamped`)
+  console.log(`[set-exe-identity] done — ${identity.productName} icon + identity stamped`)
 }
 
-export { resolveProductIdentity, stampExeIdentity }
+export { buildRceditOptions, resolveProductIdentity, stampExeIdentity }
 
 // CLI entry point: `node scripts/set-exe-identity.mjs <exe>`.
 if (isMain(import.meta.url)) {

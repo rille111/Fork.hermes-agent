@@ -299,6 +299,7 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname, e
 
 _FILE_MUTATION_SNAPSHOT_LIMIT = 10
 _FILE_MUTATION_TARGET_INSPECTION_LIMIT = 100
+_FILE_MUTATION_RAW_RESULT_UNSET = object()
 # Stable signatures read each eligible file twice. Across ten worker-time
 # snapshots and ten cached final checks, verifier content I/O stays <= 40 MiB.
 _FILE_MUTATION_SIGNATURE_MAX_BYTES = 1024 * 1024
@@ -3482,6 +3483,12 @@ class AIAgent:
         failure_snapshots: Optional[
             Dict[str, Optional[Dict[str, Any]]]
         ] = None,
+        *,
+        raw_result: Any = _FILE_MUTATION_RAW_RESULT_UNSET,
+        dispatch: Optional[str] = None,
+        blocked: bool = False,
+        effective_task_id: Optional[str] = None,
+        turn_generation: Optional[int] = None,
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
@@ -3495,6 +3502,68 @@ class AIAgent:
             return
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
+            return
+        if (
+            dispatch is not None
+            or raw_result is not _FILE_MUTATION_RAW_RESULT_UNSET
+            or blocked
+            or effective_task_id is not None
+            or turn_generation is not None
+            or getattr(self, "_file_mutation_verifier", None) is not None
+        ):
+            if not self._file_mutation_verifier_enabled():
+                return
+            from agent.file_mutation_verifier import (
+                DispatchTriState,
+                ensure_verifier,
+                sync_legacy_failed_state,
+            )
+
+            verifier = ensure_verifier(self)
+            tri = (
+                DispatchTriState(dispatch)
+                if dispatch is not None
+                else (
+                    DispatchTriState.NOT_DISPATCHED
+                    if blocked
+                    else DispatchTriState.DISPATCHED
+                )
+            )
+            raw = (
+                raw_result
+                if raw_result is not _FILE_MUTATION_RAW_RESULT_UNSET
+                else result
+            )
+            effective_scope = effective_task_id or task_id or "default"
+            verifier.record_tool_outcome(
+                tool_name=tool_name,
+                effective_args=args,
+                effective_task_id=effective_scope,
+                raw_result=raw,
+                dispatch=tri,
+                model_is_error=is_error,
+                blocked=blocked,
+                turn_generation=turn_generation,
+            )
+            if blocked or tri is DispatchTriState.NOT_DISPATCHED:
+                return
+            verifier.observe_after_tool(
+                tool_name=tool_name,
+                effective_task_id=effective_scope,
+                blocked=blocked,
+            )
+            sync_legacy_failed_state(self)
+            if not blocked and tri is DispatchTriState.DISPATCHED:
+                if file_mutation_result_landed(tool_name, raw):
+                    changed = getattr(self, "_turn_file_mutation_paths", None)
+                    if changed is not None:
+                        changed.update(
+                            _extract_landed_file_mutation_paths(
+                                tool_name,
+                                args,
+                                raw,
+                            )
+                        )
             return
         all_targets = list(dict.fromkeys(
             _extract_file_mutation_targets(tool_name, args),
@@ -3676,8 +3745,7 @@ class AIAgent:
                         allow_resolution=False,
                     )
                 if {identity, lexical_identity} & successful_identities:
-                    if info.get("_task_id", task_id) == task_id:
-                        state.pop(state_path, None)
+                    state.pop(state_path, None)
 
     @classmethod
     def _file_mutation_target_identity(

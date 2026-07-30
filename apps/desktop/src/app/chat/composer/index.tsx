@@ -173,7 +173,7 @@ export function ChatBar({
     popoutAllowed,
     popoutPosition,
     poppedOut
-  } = useComposerPopout({ composerRef })
+  } = useComposerPopout({ allowed: scope.popoutAllowed, composerRef })
 
   // Coordinator-owned: the draft engine reads the live queue-edit snapshot off
   // this ref (to suppress its stash while editing a queued prompt) and the queue

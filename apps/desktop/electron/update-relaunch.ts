@@ -64,13 +64,20 @@ function resolveUnpackedRelease(execPath, updateRoot, platform) {
     return null
   }
 
-  const releaseDir = path.join(updateRoot, 'apps', 'desktop', 'release')
-  const unpacked = path.join(releaseDir, unpackedDirName(platform))
-  const normalizedExec = path.resolve(String(execPath))
+  const pathApi = platform === 'win32' ? path.win32 : path.posix
+  const releaseDir = pathApi.join(updateRoot, 'apps', 'desktop', 'release')
+  const unpacked = pathApi.resolve(pathApi.join(releaseDir, unpackedDirName(platform)))
+  const normalizedExec = pathApi.resolve(String(execPath))
   // execPath must be the unpacked dir itself or a descendant of it.
-  const withSep = unpacked.endsWith(path.sep) ? unpacked : unpacked + path.sep
+  const withSep = unpacked.endsWith(pathApi.sep) ? unpacked : unpacked + pathApi.sep
+  // Windows paths are case-insensitive even though JavaScript string
+  // comparisons are not. Preserve the canonical path returned to callers,
+  // but fold both operands for the containment check.
+  const comparableExec = platform === 'win32' ? normalizedExec.toLowerCase() : normalizedExec
+  const comparableUnpacked = platform === 'win32' ? unpacked.toLowerCase() : unpacked
+  const comparableWithSep = platform === 'win32' ? withSep.toLowerCase() : withSep
 
-  if (normalizedExec === unpacked || normalizedExec.startsWith(withSep)) {
+  if (comparableExec === comparableUnpacked || comparableExec.startsWith(comparableWithSep)) {
     return unpacked
   }
 

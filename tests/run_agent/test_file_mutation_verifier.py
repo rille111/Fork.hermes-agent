@@ -920,7 +920,7 @@ class TestRecordFileMutationResult:
             False,
         )
 
-        assert "b.py" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "b.py")
         assert agent._turn_file_mutation_paths == {"a.py"}
 
     def test_write_file_with_lint_error_counts_as_landed(self):
@@ -931,7 +931,7 @@ class TestRecordFileMutationResult:
             json.dumps({"error": "write failed"}),
             is_error=True,
         )
-        assert "/tmp/a.py" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.py")
 
         result = json.dumps({
             "bytes_written": 24,
@@ -955,7 +955,7 @@ class TestRecordFileMutationResult:
             json.dumps({"error": "Could not find old_string"}),
             is_error=True,
         )
-        assert "/tmp/a.py" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.py")
 
         result = json.dumps({
             "success": True,
@@ -999,7 +999,9 @@ class TestRecordFileMutationResult:
             "patch", {"mode": "patch", "patch": body},
             json.dumps({"error": "parse failure"}), is_error=True,
         )
-        assert set(agent._turn_failed_file_mutations) == {"/tmp/a.md", "/tmp/b.md"}
+        assert len(agent._turn_failed_file_mutations) == 2
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.md")
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/b.md")
 
     @staticmethod
     def _repeated_target_patch_body() -> str:
@@ -1192,7 +1194,7 @@ class TestRecordFileMutationResult:
             task_id="task-b",
         )
 
-        assert r"dir\file.txt" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, r"dir\file.txt")
 
     def test_shared_remote_authority_preserves_distinct_workspaces(
         self,

@@ -29,6 +29,8 @@ export interface ComposerScope {
   $messages: ReadableAtom<ChatMessage[]>
   /** Focus-bus routing key (`'main'` | `'tile:<id>'`). */
   target: ComposerTarget
+  /** Whether this chat surface may detach its composer from the dock. */
+  popoutAllowed: boolean
 }
 
 export const MAIN_COMPOSER_SCOPE: ComposerScope = {
@@ -36,7 +38,6 @@ export const MAIN_COMPOSER_SCOPE: ComposerScope = {
   $messages,
   attachments: mainComposerScope,
   popoutAllowed: false,
-  readMessages: () => $messages.get(),
   target: 'main'
 }
 

@@ -2104,14 +2104,15 @@ class TestBuildSafeEnv:
         with patch.dict("os.environ", fake_env, clear=True):
             result = _build_safe_env(None)
 
-        assert result["ProgramFiles"] == r"C:\Program Files"
-        assert result["ProgramData"] == r"C:\ProgramData"
-        assert result["ProgramW6432"] == r"C:\Program Files"
-        assert result["LOCALAPPDATA"].endswith("Local")
-        assert result["APPDATA"].endswith("Roaming")
-        assert result["USERPROFILE"] == r"C:\Users\alice"
-        assert "GITHUB_TOKEN" not in result
-        assert "OPENAI_API_KEY" not in result
+        result_upper = {key.upper(): value for key, value in result.items()}
+        assert result_upper["PROGRAMFILES"] == r"C:\Program Files"
+        assert result_upper["PROGRAMDATA"] == r"C:\ProgramData"
+        assert result_upper["PROGRAMW6432"] == r"C:\Program Files"
+        assert result_upper["LOCALAPPDATA"].endswith("Local")
+        assert result_upper["APPDATA"].endswith("Roaming")
+        assert result_upper["USERPROFILE"] == r"C:\Users\alice"
+        assert "GITHUB_TOKEN" not in result_upper
+        assert "OPENAI_API_KEY" not in result_upper
 
 
 # ---------------------------------------------------------------------------
@@ -4920,7 +4921,7 @@ class TestMCPDiscoveryCrossProcessLock:
         if sys.platform == "win32":
             import portalocker
 
-            self._lock_exclusive(fh)
+            portalocker.lock(fh, portalocker.LOCK_EX | portalocker.LOCK_NB)
         else:
             import fcntl
 
