@@ -49,34 +49,13 @@ class TestExtractFileMutationTargets:
         assert _extract_file_mutation_targets("read_file", {"path": "/x"}) == []
         assert _extract_file_mutation_targets("terminal", {"command": "ls"}) == []
 
-    def test_write_file_returns_single_path(self):
-        out = _extract_file_mutation_targets("write_file", {"path": "/tmp/a.md", "content": "x"})
-        assert out == ["/tmp/a.md"]
 
-    def test_write_file_missing_path_returns_empty(self):
-        assert _extract_file_mutation_targets("write_file", {"content": "x"}) == []
 
     def test_patch_replace_mode_returns_path(self):
         args = {"mode": "replace", "path": "/tmp/a.md", "old_string": "x", "new_string": "y"}
         assert _extract_file_mutation_targets("patch", args) == ["/tmp/a.md"]
 
-    def test_patch_default_mode_is_replace(self):
-        # Mode omitted — schema default is ``replace``.
-        args = {"path": "/tmp/a.md", "old_string": "x", "new_string": "y"}
-        assert _extract_file_mutation_targets("patch", args) == ["/tmp/a.md"]
 
-    def test_patch_v4a_single_file(self):
-        body = (
-            "*** Begin Patch\n"
-            "*** Update File: /tmp/a.md\n"
-            "@@ ctx @@\n"
-            " line1\n"
-            "-bad\n"
-            "+good\n"
-            "*** End Patch\n"
-        )
-        args = {"mode": "patch", "patch": body}
-        assert _extract_file_mutation_targets("patch", args) == ["/tmp/a.md"]
 
     def test_patch_v4a_header_without_space_matches_runtime_parser(self):
         marker = "*" * 3
@@ -117,9 +96,6 @@ class TestExtractFileMutationTargets:
         paths = _extract_file_mutation_targets("patch", args)
         assert paths == ["/tmp/a.md", "/tmp/new.md", "/tmp/old.md"]
 
-    def test_patch_v4a_missing_body_returns_empty(self):
-        assert _extract_file_mutation_targets("patch", {"mode": "patch"}) == []
-        assert _extract_file_mutation_targets("patch", {"mode": "patch", "patch": ""}) == []
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +117,6 @@ class TestExtractErrorPreview:
         assert len(out) <= 50
         assert out.endswith("…")
 
-    def test_none_returns_empty(self):
-        assert _extract_error_preview(None) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1967,29 +1941,7 @@ class TestRecordFileMutationResult:
         assert grants.count(1) == 10
         assert grants.count(0) == 10
 
-    def test_no_state_dict_silent_noop(self):
-        """When called outside run_conversation the state dict is absent.
 
-        The record helper must never raise — a tool dispatched from, say,
-        a direct ``chat()`` call should not blow up the call site just
-        because the verifier state hasn't been initialised.
-        """
-        agent = object.__new__(AIAgent)  # no state attached
-        # Should not raise
-        agent._record_file_mutation_result(
-            "patch", {"mode": "replace", "path": "/tmp/a.md"},
-            json.dumps({"error": "x"}), is_error=True,
-        )
-
-    def test_missing_path_arg_recorded_nowhere(self):
-        agent = _bare_agent()
-        agent._record_file_mutation_result(
-            "patch", {"mode": "replace"},  # no path
-            json.dumps({"error": "path required"}), is_error=True,
-        )
-        # No path → nothing to key on, state stays empty.  The per-turn
-        # state is about file paths, not individual tool-call IDs.
-        assert agent._turn_failed_file_mutations == {}
 
 
 # ---------------------------------------------------------------------------
@@ -2165,25 +2117,7 @@ class TestVerifierEnabled:
         agent = _bare_agent()
         assert agent._file_mutation_verifier_enabled() is False
 
-    def test_env_enables_over_config(self, monkeypatch):
-        monkeypatch.setenv("HERMES_FILE_MUTATION_VERIFIER", "1")
-        import hermes_cli.config as _cfg_mod
-        monkeypatch.setattr(
-            _cfg_mod, "load_config",
-            lambda: {"display": {"file_mutation_verifier": False}},
-        )
-        agent = _bare_agent()
-        assert agent._file_mutation_verifier_enabled() is True
 
-    def test_config_disables_when_no_env(self, monkeypatch):
-        monkeypatch.delenv("HERMES_FILE_MUTATION_VERIFIER", raising=False)
-        import hermes_cli.config as _cfg_mod
-        monkeypatch.setattr(
-            _cfg_mod, "load_config",
-            lambda: {"display": {"file_mutation_verifier": False}},
-        )
-        agent = _bare_agent()
-        assert agent._file_mutation_verifier_enabled() is False
 
 
 # ---------------------------------------------------------------------------

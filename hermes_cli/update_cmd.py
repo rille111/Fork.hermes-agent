@@ -1392,6 +1392,9 @@ def _invalidate_update_cache():
 
 def _write_marker_file(path: Path, *, label: str) -> None:
     """Drop an update-recovery breadcrumb. Never raises."""
+    if _m()._pytest_owns_live_checkout(path.parent):
+        logger.debug("Skipping %s marker under pytest (live checkout)", label)
+        return
     try:
         path.write_text(
             f"started={_time.time()}\npid={os.getpid()}\n", encoding="utf-8"
@@ -3398,14 +3401,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "  Any running Hermes gateways, Desktop backends, or other "
                     "long-lived processes still use the previous runtime."
                 )
-                print(
-                    "  Restart each of them before removing the parked venv"
-                    + (
-                        f": {runtime_repaired.backup_venv}"
-                        if runtime_repaired.backup_venv is not None
-                        else "."
-                    )
-                )
+                print("  Restart each of them to pick up the repaired runtime.")
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 

@@ -56,6 +56,10 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
   if [ -f "$candidate/bin/activate" ]; then
     candidate_python="$candidate/bin/python"
   elif [ -f "$candidate/Scripts/activate" ]; then
+    # Native Windows venv layout: python.exe and activate live under
+    # Scripts/, and there is no bin/. Anyone running this script from
+    # Git Bash / MSYS with a `python -m venv`- or uv-created venv hits
+    # this branch — without it the canonical runner refuses to start.
     candidate_python="$candidate/Scripts/python.exe"
   fi
   if [ -n "$candidate_python" ]; then
