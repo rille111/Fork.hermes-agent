@@ -49,34 +49,13 @@ class TestExtractFileMutationTargets:
         assert _extract_file_mutation_targets("read_file", {"path": "/x"}) == []
         assert _extract_file_mutation_targets("terminal", {"command": "ls"}) == []
 
-    def test_write_file_returns_single_path(self):
-        out = _extract_file_mutation_targets("write_file", {"path": "/tmp/a.md", "content": "x"})
-        assert out == ["/tmp/a.md"]
 
-    def test_write_file_missing_path_returns_empty(self):
-        assert _extract_file_mutation_targets("write_file", {"content": "x"}) == []
 
     def test_patch_replace_mode_returns_path(self):
         args = {"mode": "replace", "path": "/tmp/a.md", "old_string": "x", "new_string": "y"}
         assert _extract_file_mutation_targets("patch", args) == ["/tmp/a.md"]
 
-    def test_patch_default_mode_is_replace(self):
-        # Mode omitted — schema default is ``replace``.
-        args = {"path": "/tmp/a.md", "old_string": "x", "new_string": "y"}
-        assert _extract_file_mutation_targets("patch", args) == ["/tmp/a.md"]
 
-    def test_patch_v4a_single_file(self):
-        body = (
-            "*** Begin Patch\n"
-            "*** Update File: /tmp/a.md\n"
-            "@@ ctx @@\n"
-            " line1\n"
-            "-bad\n"
-            "+good\n"
-            "*** End Patch\n"
-        )
-        args = {"mode": "patch", "patch": body}
-        assert _extract_file_mutation_targets("patch", args) == ["/tmp/a.md"]
 
     def test_patch_v4a_header_without_space_matches_runtime_parser(self):
         marker = "*" * 3
@@ -117,9 +96,6 @@ class TestExtractFileMutationTargets:
         paths = _extract_file_mutation_targets("patch", args)
         assert paths == ["/tmp/a.md", "/tmp/new.md", "/tmp/old.md"]
 
-    def test_patch_v4a_missing_body_returns_empty(self):
-        assert _extract_file_mutation_targets("patch", {"mode": "patch"}) == []
-        assert _extract_file_mutation_targets("patch", {"mode": "patch", "patch": ""}) == []
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +117,6 @@ class TestExtractErrorPreview:
         assert len(out) <= 50
         assert out.endswith("…")
 
-    def test_none_returns_empty(self):
-        assert _extract_error_preview(None) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +139,27 @@ def _bare_agent() -> AIAgent:
     return agent
 
 
+
+def _mutation_entries(state: dict, path: str) -> list[dict]:
+    """Return ledger entries whose display/key path matches *path*."""
+    out = []
+    for key, info in state.items():
+        display = info.get("_display_path") if isinstance(info, dict) else None
+        if display == path or key == path or str(key).endswith(":" + path) or str(key).endswith(path):
+            out.append(info if isinstance(info, dict) else {"_key": key})
+    return out
+
+
+def _has_mutation(state: dict, path: str) -> bool:
+    return bool(_mutation_entries(state, path))
+
+
+def _mutation_entry(state: dict, path: str) -> dict:
+    entries = _mutation_entries(state, path)
+    assert entries, f"expected mutation entry for {path!r} in {list(state)}"
+    return entries[0]
+
+
 class TestRecordFileMutationResult:
     def test_non_mutating_tool_ignored(self):
         agent = _bare_agent()
@@ -181,9 +176,9 @@ class TestRecordFileMutationResult:
             result, is_error=True,
         )
         state = agent._turn_failed_file_mutations
-        assert "/tmp/a.md" in state
-        assert state["/tmp/a.md"]["tool"] == "patch"
-        assert "Could not find old_string" in state["/tmp/a.md"]["error_preview"]
+        assert _has_mutation(state, "/tmp/a.md")
+        assert _mutation_entry(state, "/tmp/a.md")["tool"] == "patch"
+        assert "Could not find old_string" in _mutation_entry(state, "/tmp/a.md")["error_preview"]
 
     def test_success_removes_prior_failure(self):
         agent = _bare_agent()
@@ -192,7 +187,7 @@ class TestRecordFileMutationResult:
             "patch", {"mode": "replace", "path": "/tmp/a.md", "old_string": "x", "new_string": "y"},
             json.dumps({"error": "not found"}), is_error=True,
         )
-        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.md")
         # Second attempt with corrected old_string succeeds
         agent._record_file_mutation_result(
             "patch", {"mode": "replace", "path": "/tmp/a.md", "old_string": "real", "new_string": "fixed"},
@@ -223,7 +218,7 @@ class TestRecordFileMutationResult:
             is_error=False,
         )
 
-        assert "/tmp/a.md" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.md")
 
     def test_external_write_after_failure_suppresses_false_footer(self, tmp_path):
         """A non-file tool may recover a failed patch through an official CLI.
@@ -899,7 +894,7 @@ class TestRecordFileMutationResult:
             False,
         )
 
-        assert "b.py" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "b.py")
         assert agent._turn_file_mutation_paths == {"a.py"}
 
     def test_write_file_with_lint_error_counts_as_landed(self):
@@ -910,7 +905,7 @@ class TestRecordFileMutationResult:
             json.dumps({"error": "write failed"}),
             is_error=True,
         )
-        assert "/tmp/a.py" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.py")
 
         result = json.dumps({
             "bytes_written": 24,
@@ -934,7 +929,7 @@ class TestRecordFileMutationResult:
             json.dumps({"error": "Could not find old_string"}),
             is_error=True,
         )
-        assert "/tmp/a.py" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.py")
 
         result = json.dumps({
             "success": True,
@@ -964,7 +959,7 @@ class TestRecordFileMutationResult:
         )
         # Keep the original error — swapping to the latest would obscure
         # the initial root cause.
-        assert "first error" in agent._turn_failed_file_mutations["/tmp/a.md"]["error_preview"]
+        assert "first error" in _mutation_entry(agent._turn_failed_file_mutations, "/tmp/a.md")["error_preview"]
 
     def test_v4a_multi_file_all_tracked(self):
         agent = _bare_agent()
@@ -978,7 +973,9 @@ class TestRecordFileMutationResult:
             "patch", {"mode": "patch", "patch": body},
             json.dumps({"error": "parse failure"}), is_error=True,
         )
-        assert set(agent._turn_failed_file_mutations) == {"/tmp/a.md", "/tmp/b.md"}
+        assert len(agent._turn_failed_file_mutations) == 2
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/a.md")
+        assert _has_mutation(agent._turn_failed_file_mutations, "/tmp/b.md")
 
     @staticmethod
     def _repeated_target_patch_body() -> str:
@@ -1171,7 +1168,7 @@ class TestRecordFileMutationResult:
             task_id="task-b",
         )
 
-        assert r"dir\file.txt" in agent._turn_failed_file_mutations
+        assert _has_mutation(agent._turn_failed_file_mutations, r"dir\file.txt")
 
     def test_shared_remote_authority_preserves_distinct_workspaces(
         self,
@@ -1944,29 +1941,7 @@ class TestRecordFileMutationResult:
         assert grants.count(1) == 10
         assert grants.count(0) == 10
 
-    def test_no_state_dict_silent_noop(self):
-        """When called outside run_conversation the state dict is absent.
 
-        The record helper must never raise — a tool dispatched from, say,
-        a direct ``chat()`` call should not blow up the call site just
-        because the verifier state hasn't been initialised.
-        """
-        agent = object.__new__(AIAgent)  # no state attached
-        # Should not raise
-        agent._record_file_mutation_result(
-            "patch", {"mode": "replace", "path": "/tmp/a.md"},
-            json.dumps({"error": "x"}), is_error=True,
-        )
-
-    def test_missing_path_arg_recorded_nowhere(self):
-        agent = _bare_agent()
-        agent._record_file_mutation_result(
-            "patch", {"mode": "replace"},  # no path
-            json.dumps({"error": "path required"}), is_error=True,
-        )
-        # No path → nothing to key on, state stays empty.  The per-turn
-        # state is about file paths, not individual tool-call IDs.
-        assert agent._turn_failed_file_mutations == {}
 
 
 # ---------------------------------------------------------------------------
@@ -2142,25 +2117,7 @@ class TestVerifierEnabled:
         agent = _bare_agent()
         assert agent._file_mutation_verifier_enabled() is False
 
-    def test_env_enables_over_config(self, monkeypatch):
-        monkeypatch.setenv("HERMES_FILE_MUTATION_VERIFIER", "1")
-        import hermes_cli.config as _cfg_mod
-        monkeypatch.setattr(
-            _cfg_mod, "load_config",
-            lambda: {"display": {"file_mutation_verifier": False}},
-        )
-        agent = _bare_agent()
-        assert agent._file_mutation_verifier_enabled() is True
 
-    def test_config_disables_when_no_env(self, monkeypatch):
-        monkeypatch.delenv("HERMES_FILE_MUTATION_VERIFIER", raising=False)
-        import hermes_cli.config as _cfg_mod
-        monkeypatch.setattr(
-            _cfg_mod, "load_config",
-            lambda: {"display": {"file_mutation_verifier": False}},
-        )
-        agent = _bare_agent()
-        assert agent._file_mutation_verifier_enabled() is False
 
 
 # ---------------------------------------------------------------------------

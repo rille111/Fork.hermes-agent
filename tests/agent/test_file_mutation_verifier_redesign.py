@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
 from agent.file_mutation_verifier import (
+    ContentFingerprint,
     DispatchTriState,
     TurnFileMutationVerifier,
     _path_allowed_for_observation,
@@ -15,6 +17,23 @@ from agent.file_mutation_verifier import (
     sync_legacy_failed_state,
 )
 from run_agent import AIAgent, _extract_file_mutation_targets
+
+
+
+def _record(agent, tool_name, args, result, is_error=True, **kwargs):
+    """Call the recorder with the effective dispatch contract."""
+    task_id = kwargs.get("effective_task_id") or kwargs.get("task_id") or "default"
+    return agent._record_file_mutation_result(
+        tool_name,
+        args,
+        result,
+        is_error,
+        raw_result=kwargs.get("raw_result", result),
+        dispatch=kwargs.get("dispatch"),
+        blocked=kwargs.get("blocked", False),
+        effective_task_id=task_id,
+        turn_generation=kwargs.get("turn_generation"),
+    )
 
 
 def _bare_agent() -> AIAgent:
@@ -36,7 +55,8 @@ class TestContentTransitionSuppressesFooter:
 
         agent = _bare_agent()
         fail = json.dumps({"success": False, "error": "Write denied (simulated)"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "config.yaml", "old_string": "x", "new_string": "y"},
             fail,
@@ -60,7 +80,8 @@ class TestContentTransitionSuppressesFooter:
 
         agent = _bare_agent()
         fail = json.dumps({"error": "Could not find old_string"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "stale.py", "old_string": "nope", "new_string": "y"},
             fail,
@@ -78,7 +99,8 @@ class TestDispatchTriState:
     def test_not_dispatched_creates_no_ledger_io(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         agent = _bare_agent()
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "write_file",
             {"path": "new.txt", "content": "x"},
             json.dumps({"bytes_written": 1}),
@@ -88,12 +110,78 @@ class TestDispatchTriState:
         )
         assert agent._turn_failed_file_mutations == {}
 
+    def test_not_dispatched_skips_post_dispatch_observation(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        agent = _bare_agent()
+
+        def unexpected_observation(**_kwargs):
+            raise AssertionError("NOT_DISPATCHED must not touch the filesystem")
+
+        monkeypatch.setattr(
+            agent._file_mutation_verifier,
+            "observe_after_tool",
+            unexpected_observation,
+        )
+        _record(
+            agent,
+            "write_file",
+            {"path": "new.txt", "content": "x"},
+            json.dumps({"bytes_written": 1}),
+            is_error=False,
+            dispatch=DispatchTriState.NOT_DISPATCHED.value,
+        )
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_explicit_none_raw_result_is_not_replaced_by_visible_success(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "unknown.txt"
+        target.write_text("before\n", encoding="utf-8")
+        agent = _bare_agent()
+        agent._file_mutation_verifier.prepare_mutation_dispatch(
+            tool_name="write_file",
+            effective_args={"path": str(target), "content": "after"},
+            effective_task_id="default",
+            turn_generation=1,
+        )
+
+        _record(
+            agent,
+            "write_file",
+            {"path": str(target), "content": "after"},
+            json.dumps({"success": True}),
+            is_error=False,
+            raw_result=None,
+            dispatch=DispatchTriState.DISPATCHED_NO_RESULT.value,
+            turn_generation=1,
+        )
+
+        assert any(
+            key.endswith("unknown.txt")
+            for key in agent._turn_failed_file_mutations
+        )
+        target.write_text("after\n", encoding="utf-8")
+        from agent.file_mutation_verifier import sync_legacy_failed_state
+
+        sync_legacy_failed_state(agent)
+        assert agent._format_file_mutation_failure_footer(
+            agent._turn_failed_file_mutations,
+        ) == ""
+
     def test_middleware_short_circuit_does_not_clear_prior_failure(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         (tmp_path / "a.txt").write_text("x\n", encoding="utf-8")
         agent = _bare_agent()
         fail = json.dumps({"error": "first"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "a.txt", "old_string": "x", "new_string": "y"},
             fail,
@@ -101,7 +189,8 @@ class TestDispatchTriState:
             raw_result=fail,
             dispatch=DispatchTriState.DISPATCHED.value,
         )
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "write_file",
             {"path": "a.txt", "content": "landed"},
             json.dumps({"bytes_written": 6}),
@@ -160,6 +249,30 @@ class TestPathSafety:
         assert not _path_allowed_for_observation(r"\\server\share\file.txt")
 
 
+class TestLazyBackendClassification:
+    def test_configured_ssh_without_active_env_never_reads_host_path(
+        self, monkeypatch,
+    ):
+        import agent.file_mutation_verifier as fmv
+
+        monkeypatch.setattr("tools.terminal_tool.get_active_env", lambda _task_id: None)
+        monkeypatch.setattr(
+            "tools.file_tools._terminal_env_type_for_task_strict",
+            lambda _task_id: "ssh",
+        )
+
+        def unexpected_host_resolution(*_args, **_kwargs):
+            raise AssertionError("lazy remote mutation must not resolve a host path")
+
+        monkeypatch.setattr(fmv, "_resolve_local_path", unexpected_host_resolution)
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
+        verifier.reset_turn(1)
+
+        assert verifier._capture_baseline(
+            "remote.txt", "remote-task", turn_generation=1,
+        ) is None
+
+
 class TestFooterSanitization:
     def test_media_injection_neutralized(self):
         failed = {
@@ -191,7 +304,8 @@ class TestMetadataOnlyChange:
             turn_generation=1,
         )
         fail = json.dumps({"error": "failed"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "meta.py", "old_string": "x", "new_string": "y"},
             fail,
@@ -216,7 +330,8 @@ class TestPathAliasReconciliation:
         target.write_text("start\n", encoding="utf-8")
         agent = _bare_agent()
         fail = json.dumps({"error": "nope"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "alias.py", "old_string": "x", "new_string": "y"},
             fail,
@@ -238,7 +353,8 @@ class TestTurnGenerationBudget:
         agent = _bare_agent()
         agent._file_mutation_verifier.reset_turn(2)
         fail = json.dumps({"error": "late"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "write_file",
             {"path": "z.txt", "content": "a"},
             fail,
@@ -248,6 +364,46 @@ class TestTurnGenerationBudget:
             turn_generation=1,
         )
         assert agent._turn_failed_file_mutations == {}
+
+    def test_reset_during_fingerprint_discards_stale_snapshot(
+        self, tmp_path, monkeypatch,
+    ):
+        import agent.file_mutation_verifier as fmv
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "slow.txt").write_text("old\n", encoding="utf-8")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_fingerprint(*_args, **_kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            return ContentFingerprint(4, b"digest", 1, 1), 4
+
+        monkeypatch.setattr(fmv, "_stable_local_fingerprint", blocking_fingerprint)
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
+        verifier.reset_turn(1)
+        worker = threading.Thread(
+            target=verifier.prepare_mutation_dispatch,
+            kwargs={
+                "tool_name": "write_file",
+                "effective_args": {"path": "slow.txt", "content": "new\n"},
+                "effective_task_id": "default",
+                "turn_generation": 1,
+            },
+        )
+        worker.start()
+        assert entered.wait(timeout=5)
+
+        verifier.reset_turn(2)
+        release.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert verifier.generation == 2
+        assert verifier._budget.snapshot_attempts == 0
+        assert verifier._budget.snapshot_bytes == 0
+        assert verifier._pre_dispatch_baselines == {}
 
 
 class TestPreDispatchBaseline:
@@ -274,7 +430,9 @@ class TestPreDispatchBaseline:
         )
         assert "partial.py" in verifier.finalize_failed_dict()
 
-    def test_post_dispatch_disk_change_suppresses_using_pre_baseline(self, tmp_path, monkeypatch):
+    def test_failed_partial_mutation_stays_unresolved_until_later_change(
+        self, tmp_path, monkeypatch,
+    ):
         monkeypatch.chdir(tmp_path)
         target = tmp_path / "partial.py"
         target.write_text("baseline\n", encoding="utf-8")
@@ -296,8 +454,135 @@ class TestPreDispatchBaseline:
             model_is_error=True,
             turn_generation=1,
         )
-        assert "partial.py" not in verifier.finalize_failed_dict()
+        assert "partial.py" in verifier.finalize_failed_dict()
 
+        target.write_text("later-recovery\n", encoding="utf-8")
+        assert verifier.finalize_failed_dict() == {}
+
+    def test_no_result_partial_mutation_stays_unresolved_until_later_change(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "unknown.py"
+        target.write_text("baseline\n", encoding="utf-8")
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
+        verifier.reset_turn(1)
+        verifier.prepare_mutation_dispatch(
+            tool_name="write_file",
+            effective_args={"path": "unknown.py", "content": "changed\n"},
+            effective_task_id="default",
+            turn_generation=1,
+        )
+        target.write_text("partial-effect\n", encoding="utf-8")
+        verifier.record_tool_outcome(
+            tool_name="write_file",
+            effective_args={"path": "unknown.py", "content": "changed\n"},
+            effective_task_id="default",
+            raw_result=None,
+            dispatch=DispatchTriState.DISPATCHED_NO_RESULT,
+            model_is_error=False,
+            turn_generation=1,
+        )
+        assert "unknown.py" in verifier.finalize_failed_dict()
+
+        target.write_text("later-recovery\n", encoding="utf-8")
+        assert verifier.finalize_failed_dict() == {}
+
+    def test_repeated_failure_refreshes_to_latest_pre_dispatch_baseline(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "repeat.py"
+        target.write_text("v1\n", encoding="utf-8")
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
+        verifier.reset_turn(1)
+
+        verifier.prepare_mutation_dispatch(
+            tool_name="write_file",
+            effective_args={"path": "repeat.py", "content": "v2\n"},
+            effective_task_id="default",
+            turn_generation=1,
+        )
+        verifier.record_tool_outcome(
+            tool_name="write_file",
+            effective_args={"path": "repeat.py", "content": "v2\n"},
+            effective_task_id="default",
+            raw_result=json.dumps({"error": "first failure"}),
+            dispatch=DispatchTriState.DISPATCHED,
+            model_is_error=True,
+            turn_generation=1,
+        )
+
+        target.write_text("v2\n", encoding="utf-8")
+        verifier.prepare_mutation_dispatch(
+            tool_name="write_file",
+            effective_args={"path": "repeat.py", "content": "v3\n"},
+            effective_task_id="default",
+            turn_generation=1,
+        )
+        verifier.record_tool_outcome(
+            tool_name="write_file",
+            effective_args={"path": "repeat.py", "content": "v3\n"},
+            effective_task_id="default",
+            raw_result=json.dumps({"error": "second failure"}),
+            dispatch=DispatchTriState.DISPATCHED,
+            model_is_error=True,
+            turn_generation=1,
+        )
+
+        failed = verifier.finalize_failed_dict()
+        assert "repeat.py" in failed
+        assert "second failure" in failed["repeat.py"]["error_preview"]
+
+    def test_missing_target_can_transition_to_the_sentinel_literal(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
+        verifier.reset_turn(1)
+        content = "hermes:file-mutation-target-missing"
+
+        verifier.prepare_mutation_dispatch(
+            tool_name="write_file",
+            effective_args={"path": "created.txt", "content": content},
+            effective_task_id="default",
+            turn_generation=1,
+        )
+        (tmp_path / "created.txt").write_text(content, encoding="utf-8")
+        verifier.record_tool_outcome(
+            tool_name="write_file",
+            effective_args={"path": "created.txt", "content": content},
+            effective_task_id="default",
+            raw_result=json.dumps({"error": "late wrapper failure"}),
+            dispatch=DispatchTriState.DISPATCHED,
+            model_is_error=True,
+            turn_generation=1,
+        )
+
+        # Content may have changed from "missing" to the sentinel literal, but
+        # an explicit tool error must not self-clear via its own partial write.
+        failed = verifier.finalize_failed_dict()
+        assert "created.txt" in failed
+        assert "late wrapper failure" in failed["created.txt"]["error_preview"]
+
+        # A later successful write still clears the unresolved warning.
+        verifier.prepare_mutation_dispatch(
+            tool_name="write_file",
+            effective_args={"path": "created.txt", "content": "ok\n"},
+            effective_task_id="default",
+            turn_generation=1,
+        )
+        (tmp_path / "created.txt").write_text("ok\n", encoding="utf-8")
+        verifier.record_tool_outcome(
+            tool_name="write_file",
+            effective_args={"path": "created.txt", "content": "ok\n"},
+            effective_task_id="default",
+            raw_result=json.dumps({"bytes_written": 3, "path": "created.txt"}),
+            dispatch=DispatchTriState.DISPATCHED,
+            model_is_error=False,
+            turn_generation=1,
+        )
+        assert verifier.finalize_failed_dict() == {}
 
 class TestRecoveredThenFailedAgain:
     def test_later_failure_after_transition(self, tmp_path, monkeypatch):
@@ -306,7 +591,8 @@ class TestRecoveredThenFailedAgain:
         p.write_text("v1\n", encoding="utf-8")
         agent = _bare_agent()
         fail1 = json.dumps({"error": "first"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "flip.py", "old_string": "v1", "new_string": "v2"},
             fail1,
@@ -321,7 +607,8 @@ class TestRecoveredThenFailedAgain:
         assert agent._turn_failed_file_mutations == {}
 
         fail2 = json.dumps({"error": "second failure"})
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "flip.py", "old_string": "v9", "new_string": "v3"},
             fail2,
@@ -441,28 +728,21 @@ class TestRegistryDispatchAuthority:
             "hermes_cli.middleware.run_tool_execution_middleware",
             _short_circuit,
         )
-        from model_tools import (
-            begin_tool_registry_dispatch_tracking,
-            end_tool_registry_dispatch_tracking,
-            handle_function_call,
-            tool_registry_was_dispatched,
-        )
+        from model_tools import handle_function_call
 
-        token = begin_tool_registry_dispatch_tracking()
-        try:
-            handle_function_call(
-                "write_file",
-                {"path": "never.txt", "content": "x"},
-                task_id="default",
-                skip_pre_tool_call_hook=True,
-            )
-            dispatched = tool_registry_was_dispatched()
-        finally:
-            end_tool_registry_dispatch_tracking(token)
-        assert not dispatched
+        observed_dispatch = {}
+        handle_function_call(
+            "write_file",
+            {"path": "never.txt", "content": "x"},
+            task_id="default",
+            skip_pre_tool_call_hook=True,
+            observed_dispatch_out=observed_dispatch,
+        )
+        assert observed_dispatch == {}
 
         agent = _bare_agent()
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "patch",
             {"mode": "replace", "path": "a.txt", "old_string": "x", "new_string": "y"},
             json.dumps({"error": "first"}),
@@ -470,7 +750,8 @@ class TestRegistryDispatchAuthority:
             raw_result=json.dumps({"error": "first"}),
             dispatch=DispatchTriState.DISPATCHED.value,
         )
-        agent._record_file_mutation_result(
+        _record(
+            agent,
             "write_file",
             {"path": "never.txt", "content": "x"},
             json.dumps({"success": True, "bytes_written": 12}),

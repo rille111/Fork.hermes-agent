@@ -32,6 +32,7 @@ class _FooterAgent:
         self._turn_file_mutation_paths = set()
         self._file_mutation_verifier = TurnFileMutationVerifier(use_subprocess_fingerprint=False)
         self._file_mutation_verifier.reset_turn(1)
+        self.persisted_messages = None
         for attr in (
             "session_input_tokens",
             "session_output_tokens",
@@ -67,8 +68,8 @@ class _FooterAgent:
     def _drop_trailing_empty_response_scaffolding(self, *a, **k):
         pass
 
-    def _persist_session(self, *a, **k):
-        pass
+    def _persist_session(self, messages, *_args, **_kwargs):
+        self.persisted_messages = [dict(message) for message in messages]
 
     def _emit_status(self, *a, **k):
         pass
@@ -131,6 +132,9 @@ def test_interrupted_empty_turn_still_gets_footer(tmp_path, monkeypatch):
     sync_legacy_failed_state(agent)
     result = _finalize(agent, final_response="", interrupted=True)
     assert "File-mutation verifier" in (result["final_response"] or "")
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["role"] == "assistant"
+    assert "File-mutation verifier" in agent.persisted_messages[-1]["content"]
 
 
 def test_formatter_exception_uses_generic_fallback(tmp_path, monkeypatch):
@@ -160,3 +164,36 @@ def test_formatter_exception_uses_generic_fallback(tmp_path, monkeypatch):
     assert "partial answer" in text
     assert "File-mutation verifier" in text
     assert "git status" in text.lower() or "read_file" in text
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == text
+
+
+def test_output_transform_cannot_remove_mutation_warning(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "bad.py").write_text("x\n", encoding="utf-8")
+    agent = _FooterAgent()
+    fail = json.dumps({"error": "nope"})
+    agent._file_mutation_verifier.record_tool_outcome(
+        tool_name="write_file",
+        effective_args={"path": "bad.py", "content": "y\n"},
+        effective_task_id="default",
+        raw_result=fail,
+        dispatch=__import__(
+            "agent.file_mutation_verifier", fromlist=["DispatchTriState"]
+        ).DispatchTriState.DISPATCHED,
+        model_is_error=True,
+        turn_generation=1,
+    )
+    sync_legacy_failed_state(agent)
+
+    def invoke_hook(name, **_kwargs):
+        return ["transformed answer"] if name == "transform_llm_output" else []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke_hook)
+    result = _finalize(agent, final_response="model answer")
+    text = result["final_response"] or ""
+
+    assert "transformed answer" in text
+    assert "File-mutation verifier" in text
+    assert agent.persisted_messages is not None
+    assert "File-mutation verifier" in agent.persisted_messages[-1]["content"]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -275,24 +276,33 @@ class ToolCallGuardrailController:
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._lock = threading.RLock()
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
-        self._exact_failure_counts: dict[ToolCallSignature, int] = {}
-        self._same_tool_failure_counts: dict[str, int] = {}
-        self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
-        self._halt_decision: ToolGuardrailDecision | None = None
-        # Per-turn runaway-loop cap counters. Reset every turn (this method
-        # runs at the start of each run_conversation), so the caps bound a
-        # single agent loop rather than accumulating across the session.
-        self._turn_web_search_count = 0
-        self._turn_subagent_count = 0
+        with self._lock:
+            self._exact_failure_counts: dict[ToolCallSignature, int] = {}
+            self._same_tool_failure_counts: dict[str, int] = {}
+            self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+            self._halt_decision: ToolGuardrailDecision | None = None
+            # Per-turn runaway-loop cap counters. Reset every turn (this method
+            # runs at the start of each run_conversation), so the caps bound a
+            # single agent loop rather than accumulating across the session.
+            self._turn_web_search_count = 0
+            self._turn_subagent_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
-        return self._halt_decision
+        with self._lock:
+            return self._halt_decision
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
+        with self._lock:
+            return self._before_call_unlocked(tool_name, args)
+
+    def _before_call_unlocked(
+        self, tool_name: str, args: Mapping[str, Any] | None,
+    ) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
 
         # ── Per-turn runaway-loop caps ──────────────────────────────────
@@ -348,6 +358,22 @@ class ToolCallGuardrailController:
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
     def after_call(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+        result: str | None,
+        *,
+        failed: bool | None = None,
+    ) -> ToolGuardrailDecision:
+        with self._lock:
+            return self._after_call_unlocked(
+                tool_name,
+                args,
+                result,
+                failed=failed,
+            )
+
+    def _after_call_unlocked(
         self,
         tool_name: str,
         args: Mapping[str, Any] | None,

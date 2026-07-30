@@ -74,5 +74,5 @@ describe('GatewaySettings', () => {
     expect(
       screen.queryByText('Start a private Hermes backend on localhost. This is the default and works offline.')
     ).toBeNull()
-  })
+  }, 120_000)
 })

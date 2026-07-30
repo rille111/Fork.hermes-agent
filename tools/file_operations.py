@@ -3,7 +3,7 @@
 File Operations Module
 
 Provides file manipulation capabilities (read, write, patch, search) that work
-across all terminal backends (local, docker, ssh, singularity, modal, daytona).
+across all terminal backends (local, docker, ssh, singularity, modal, daytona, vercel_sandbox).
 
 The key insight is that all file operations can be expressed as shell commands,
 so we wrap the terminal backend's execute() interface to provide a unified file API.
@@ -64,7 +64,9 @@ def _strip_terminal_fence_leaks(text: str) -> str:
 
     cleaned_lines: List[str] = []
     for line in text.splitlines(keepends=True):
-        had_terminal_wrapper = "__HERMES_FENCE_" in line or "\x1b]" in line
+        had_terminal_wrapper = (
+            "__HERMES_FENCE_" in line or "\x1b]" in line or "\x07" in line
+        )
         cleaned = _OSC_SEQUENCE_RE.sub("", line)
         cleaned = _FENCE_MARKER_RE.sub("", cleaned)
         cleaned = cleaned.replace("\x07", "")
@@ -2136,6 +2138,9 @@ class ShellFileOperations(FileOperations):
             part not in {".", ".."} and part.startswith(".")
             for part in search_root.parts
         )
+        native_windows_root = os.name == "nt" and bool(
+            re.match(r"^[A-Za-z]:[\\/]", path)
+        )
 
         # Prefer ripgrep: respects .gitignore, excludes hidden dirs by
         # default, and has parallel directory traversal (~200x faster than
@@ -2175,15 +2180,24 @@ class ShellFileOperations(FileOperations):
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
 
+        normalize_shell_path = None
+        if native_windows_root:
+            from tools.environments.local import _msys_to_windows_path
+
+            normalize_shell_path = _msys_to_windows_path
+
         files = []
         for line in stdout.strip().split('\n'):
             if not line:
                 continue
             parts = line.split(' ', 1)
             if len(parts) == 2 and parts[0].replace('.', '').isdigit():
-                files.append(parts[1])
+                file_path = parts[1]
             else:
-                files.append(line)
+                file_path = line
+            if normalize_shell_path is not None:
+                file_path = normalize_shell_path(file_path)
+            files.append(file_path)
 
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command
