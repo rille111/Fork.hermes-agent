@@ -2449,9 +2449,24 @@ class TestConcurrentToolExecution:
         import threading
         import time as _time
 
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        blocker = threading.Event()
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q": "fast"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q": "slow"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        flushed = []
 
+        def fake_handle(name, args, task_id, **kwargs):
+            if args.get("q") == "slow":
+                blocker.wait(5)
+                return "late"
+            return "fast-result"
 
+        def record_flush(flush_messages, conversation_history=None):
+            flushed.append([m.copy() for m in flush_messages if m.get("role") == "tool"])
 
+        agent._flush_messages_to_session_db = MagicMock(side_effect=record_flush)
 
         start = _time.monotonic()
         try:
