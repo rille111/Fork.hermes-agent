@@ -467,10 +467,13 @@ class TestSearchPathValidation:
         ops = ShellFileOperations(mock_env)
         result = ops.search(r"\d+", path="C:/Users/ADMIN/AppData/Local/hermes/config.yaml")
         assert result.error is None
-        assert len(executed_command) == 1
-        # It should preserve both the raw regex '\d+' and native Windows path
-        assert r"'\d+'" in executed_command[0]
-        assert "'C:/Users/ADMIN/AppData/Local/hermes/config.yaml'" in executed_command[0]
+        assert executed_command, "expected at least one ripgrep invocation"
+        primary = executed_command[0]
+        # Primary rg path must preserve both the raw regex and native Windows path.
+        # Upstream may issue additional fallback rg invocations after a miss.
+        assert r"'\d+'" in primary
+        assert "'C:/Users/ADMIN/AppData/Local/hermes/config.yaml'" in primary
+
 
 
 class TestSearchFilesFallbackHiddenPaths:

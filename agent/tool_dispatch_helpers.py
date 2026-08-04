@@ -415,35 +415,65 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
     """Return the file paths a ``write_file`` or ``patch`` call is targeting.
 
     For ``write_file`` and ``patch`` in replace mode this is just ``args["path"]``.
-    For ``patch`` in V4A patch mode we parse the patch content for
-    ``*** Update File:`` / ``*** Add File:`` / ``*** Delete File:`` headers so
-    the verifier can track each file in a multi-file patch separately.
+    For ``patch`` in V4A patch mode prefer the structured patch parser (same
+    rules as runtime apply). Fall back to a tolerant header scrape only when
+    the parser rejects the body (e.g. bare ``***Update File:`` without wrappers).
     """
     if tool_name not in _FILE_MUTATING_TOOLS:
         return []
     if tool_name == "write_file":
-        p = args.get("path")
-        return [str(p)] if p else []
+        pth = args.get("path")
+        return [str(pth)] if pth else []
     # tool_name == "patch"
     mode = args.get("mode") or "replace"
     if mode == "replace":
-        p = args.get("path")
-        return [str(p)] if p else []
+        pth = args.get("path")
+        return [str(pth)] if pth else []
     if mode == "patch":
         body = args.get("patch") or ""
         if not isinstance(body, str) or not body:
             return []
+
         from tools.patch_parser import OperationType, parse_v4a_patch
 
         operations, parse_error = parse_v4a_patch(body)
-        if parse_error:
-            return []
         paths: List[str] = []
-        for operation in operations:
-            if operation.file_path:
-                paths.append(operation.file_path)
-            if operation.operation == OperationType.MOVE and operation.new_path:
-                paths.append(operation.new_path)
+        if not parse_error and operations:
+            for operation in operations:
+                if operation.file_path:
+                    paths.append(operation.file_path)
+                if operation.operation == OperationType.MOVE and operation.new_path:
+                    paths.append(operation.new_path)
+            return paths
+        if not parse_error and not operations:
+            # Parser accepted the body but found no operations (e.g. split
+            # move destination on the next line). Do not invent targets.
+            return []
+
+        # Parser rejected the body — tolerant header scrape so verifier still
+        # sees targets from bare ``***Update File:`` forms without wrappers.
+        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser / file_tools.
+        for _m in re.finditer(
+            r"^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$",
+            body,
+            re.MULTILINE,
+        ):
+            pth = _m.group(1).strip()
+            if pth:
+                paths.append(pth)
+        for _m in re.finditer(
+            r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(\S.+)$",
+            body,
+            re.MULTILINE,
+        ):
+            # Require a non-whitespace destination on the same line so a bare
+            # trailing ``->`` cannot pull the next path line via ``\s``.
+            src = _m.group(1).strip()
+            dst = _m.group(2).strip()
+            if src:
+                paths.append(src)
+            if dst:
+                paths.append(dst)
         return paths
     return []
 
