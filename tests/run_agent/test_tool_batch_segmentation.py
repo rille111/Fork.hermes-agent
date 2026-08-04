@@ -211,11 +211,12 @@ class TestPlanToolBatchSegments:
             _tc("read_file", '{"path":"real.py"}', call_id="r1"),
         ]
         segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
-        # p1+w1 are disjoint → can share a parallel run; r1 overlaps real.py → new run.
+        # Fork policy: structured mutations always serialize (middleware may
+        # rewrite disjoint paths onto one physical target). Lone follow-on
+        # readers demote+merge into that sequential segment.
         assert _flatten_ids(segments) == ["p1", "w1", "r1"]
-        assert [tc.id for tc in segments[0][1]] == ["p1", "w1"]
-        assert segments[0][0] == "parallel"
-        assert [tc.id for tc in segments[1][1]] == ["r1"]
+        assert _kinds(segments) == ["sequential"]
+        assert [tc.id for tc in segments[0][1]] == ["p1", "w1", "r1"]
 
     def test_path_scoped_tool_without_path_is_a_barrier(self):
         calls = [
@@ -308,7 +309,11 @@ class TestReaderWriterPathRoles:
             _tc("search_files", '{"pattern":"foo","path":"docs"}', call_id="s1"),
         ]
         segments = _plan_tool_batch_segments(calls, execution_cwd=tmp_path)
-        assert _kinds(segments) == ["parallel"]
+        # Fork policy: writers always sequential; a lone disjoint reader is
+        # demoted and merges into the adjacent sequential segment. Emission
+        # order is preserved; concurrency is sacrificed for mutation safety.
+        assert _flatten_ids(segments) == ["w1", "s1"]
+        assert _kinds(segments) == ["sequential"]
         assert [tc.id for tc in segments[0][1]] == ["w1", "s1"]
 
     def test_writer_writer_same_path_still_splits(self, tmp_path, monkeypatch):
