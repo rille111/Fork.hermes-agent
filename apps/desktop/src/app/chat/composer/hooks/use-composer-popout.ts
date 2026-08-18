@@ -5,6 +5,7 @@ import { usePaneGroup, usePaneVisible } from '@/components/pane-shell/pane-visib
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { triggerHaptic } from '@/lib/haptics'
 import {
+  $composerPopoutGesturesEnabled,
   $composerPopoutZone,
   clampPopoutPosition,
   getComposerPopoutZone,
@@ -122,8 +123,9 @@ function usePopoutPlacement(
  * docked: a floating composer makes no sense in a scratch window.
  */
 export function useComposerPopout({ allowed = true, composerRef }: UseComposerPopoutOptions) {
-  const popoutAllowed = allowed && !isSecondaryWindow()
   const groupId = usePaneGroup()
+  const gesturesEnabled = useStore($composerPopoutGesturesEnabled)
+  const popoutAllowed = allowed && gesturesEnabled && !isSecondaryWindow()
   const zone = useStore(useMemo(() => $composerPopoutZone(groupId), [groupId]))
   const poppedOut = zone.poppedOut && popoutAllowed
 

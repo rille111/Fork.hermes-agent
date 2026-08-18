@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -247,6 +250,138 @@ class TestPathSafety:
 
     def test_unc_rejected(self):
         assert not _path_allowed_for_observation(r"\\server\share\file.txt")
+
+    def test_dedicated_verifier_policy_blocks_before_observation(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.file_safety.get_file_verifier_block_error",
+            lambda _path: "blocked",
+        )
+        assert not _path_allowed_for_observation("ordinary-looking.txt")
+
+    def test_policy_classifier_failure_is_fail_closed(self, monkeypatch):
+        def broken_classifier(_path):
+            raise RuntimeError("classifier unavailable")
+
+        monkeypatch.setattr(
+            "agent.file_safety.get_file_verifier_block_error",
+            broken_classifier,
+        )
+        assert not _path_allowed_for_observation("ordinary-looking.txt")
+
+    def test_task_relative_path_resolved_under_aws_is_not_observed(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import agent.file_mutation_verifier as fmv
+        from agent.file_safety import get_file_verifier_block_error
+
+        workspace = tmp_path / ".aws"
+        workspace.mkdir()
+        target = workspace / "credentials"
+        target.write_text("secret\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "tools.file_tools._authoritative_workspace_root",
+            lambda _task_id: str(workspace),
+        )
+        classified = []
+
+        def classify(path):
+            classified.append(path)
+            return get_file_verifier_block_error(path)
+
+        monkeypatch.setattr(
+            "agent.file_safety.get_file_verifier_block_error",
+            classify,
+        )
+        monkeypatch.setattr(
+            fmv,
+            "_path_has_link_or_reparse_ancestor",
+            lambda _path: pytest.fail("protected target must not be traversed"),
+        )
+        monkeypatch.setattr(
+            fmv,
+            "_stable_local_fingerprint",
+            lambda *_args, **_kwargs: pytest.fail("protected target must not be read"),
+        )
+        verifier = TurnFileMutationVerifier(
+            resolve_backend=lambda _task_id: ("local", "host", fmv._path_dialect()),
+            use_subprocess_fingerprint=False,
+        )
+        verifier.reset_turn(1)
+
+        assert verifier._capture_baseline(
+            "credentials",
+            "task-a",
+            turn_generation=1,
+        ) is None
+        assert classified == [os.path.normpath(str(target))]
+
+    @pytest.mark.parametrize(
+        ("mode", "attributes"),
+        [
+            (stat.S_IFLNK, 0),
+            (stat.S_IFDIR, getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)),
+        ],
+        ids=("symlink", "reparse-point"),
+    )
+    def test_intermediate_link_or_reparse_is_rejected_before_target_read(
+        self,
+        monkeypatch,
+        tmp_path,
+        mode,
+        attributes,
+    ):
+        import agent.file_mutation_verifier as fmv
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        intermediate = workspace / "linked"
+        target = intermediate / "target.txt"
+        monkeypatch.setattr(
+            "tools.file_tools._authoritative_workspace_root",
+            lambda _task_id: str(workspace),
+        )
+        real_lstat = os.lstat
+        inspected = []
+
+        def guarded_lstat(path, *args, **kwargs):
+            candidate = os.path.normcase(os.path.normpath(os.fspath(path)))
+            inspected.append(candidate)
+            if candidate == os.path.normcase(os.path.normpath(str(intermediate))):
+                return SimpleNamespace(
+                    st_mode=mode,
+                    st_file_attributes=attributes,
+                )
+            if candidate == os.path.normcase(os.path.normpath(str(target))):
+                pytest.fail("target lstat must happen after ancestor validation")
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(fmv.os, "lstat", guarded_lstat)
+        monkeypatch.setattr(
+            fmv,
+            "_stable_local_fingerprint",
+            lambda *_args, **_kwargs: pytest.fail("linked target must not be read"),
+        )
+        verifier = TurnFileMutationVerifier(
+            resolve_backend=lambda _task_id: ("local", "host", fmv._path_dialect()),
+            use_subprocess_fingerprint=False,
+        )
+        verifier.reset_turn(1)
+
+        assert verifier._capture_baseline(
+            "linked/target.txt",
+            "task-a",
+            turn_generation=1,
+        ) is None
+        assert os.path.normcase(os.path.normpath(str(intermediate))) in inspected
+        assert os.path.normcase(os.path.normpath(str(target))) not in inspected
+
+    def test_exact_ssh_config_remains_allowed_by_verifier_policy(self, monkeypatch):
+        monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
+        assert _path_allowed_for_observation(
+            str(Path.home() / ".ssh" / "config"),
+        )
 
 
 class TestLazyBackendClassification:

@@ -222,7 +222,7 @@ describe('BillingSettings', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Manage' }))
 
     expect(screen.getByRole('spinbutton', { name: 'Auto-refill threshold' })).toBeTruthy()
-    expect(screen.queryByText('Threshold: minimum is $10.')).toBeNull()
+    expect(screen.queryByText(`Threshold: minimum is ${formatMoney(10)}.`)).toBeNull()
     // Save is disabled because the prefilled config is invalid — but no error yet.
     expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true)
   })
@@ -596,7 +596,9 @@ describe('BillingSettings', () => {
     })
 
     await waitFor(() =>
-      expect(screen.getAllByText(normalizeWhitespace(`${formatMoney(25)} added. Balance is refreshing.`)).length).toBeGreaterThan(0)
+      expect(
+        screen.getAllByText(normalizeWhitespace(`${formatMoney(25)} added. Balance is refreshing.`)).length
+      ).toBeGreaterThan(0)
     )
   })
 

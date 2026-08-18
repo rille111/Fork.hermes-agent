@@ -2,6 +2,7 @@
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,10 +23,42 @@ def proj(tmp_path, monkeypatch):
 
 
 class TestZeroMatchProbe:
+    def test_windows_like_pattern_is_never_path_translated(self, proj, monkeypatch):
+        from tools.file_tools import _get_file_ops
+
+        ops = _get_file_ops(task_id="t-zm-raw-pattern")
+        pattern = r"C:\Users\ADMIN\literal.txt"
+        commands = []
+
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == "rg")
+
+        def path_escape_must_not_receive_pattern(arg):
+            raise AssertionError(f"search pattern was treated as a path: {arg!r}")
+
+        monkeypatch.setattr(ops, "_escape_shell_arg", path_escape_must_not_receive_pattern)
+
+        def capture(command, *, timeout):
+            commands.append((command, timeout))
+            return SimpleNamespace(stdout="", exit_code=1)
+
+        monkeypatch.setattr(ops, "_exec", capture)
+
+        assert ops._zero_match_probe(pattern, str(proj / "proj"), None) is None
+        assert len(commands) == 3
+        assert all(f"'{pattern}'" in command for command, _timeout in commands)
+
     def test_case_mismatch_gets_hint(self, proj):
         r = json.loads(search_tool("token_alpha", path=str(proj / "proj"), task_id="t-zm"))
         assert r["total_count"] == 0
         assert "case-insensitive" in r.get("warning", "")
+
+    def test_case_mismatch_hint_names_the_files(self, proj):
+        # The probe already ran the -i search; it must hand over the paths,
+        # not just a count (issue #80522: hint-only sent weak models into
+        # 5-search casing-variant spirals — +6 turns measured on the A/B eval).
+        r = json.loads(search_tool("token_alpha", path=str(proj / "proj"), task_id="t-zm"))
+        w = r.get("warning", "")
+        assert "a.py" in w and "b.py" in w
 
     def test_regex_metachar_literal_hint(self, proj):
         d = proj / "proj"
@@ -33,6 +66,7 @@ class TestZeroMatchProbe:
         r = json.loads(search_tool("lookup[key+1]", path=str(d), task_id="t-zm"))
         assert r["total_count"] == 0
         assert "literal match" in r.get("warning", "")
+        assert "meta.py" in r.get("warning", "")
 
     def test_true_zero_match_no_hint(self, proj):
         r = json.loads(search_tool("zzz_totally_absent_zzz", path=str(proj / "proj"), task_id="t-zm"))
@@ -46,6 +80,17 @@ class TestZeroMatchProbe:
         r = json.loads(search_tool("HIDDEN_ONLY_TOKEN", path=str(d), task_id="t-zm"))
         assert r["total_count"] == 0
         assert "hidden or gitignored" in r.get("warning", "")
+        # Same class as the casing probe: the path must be in the hint.
+        assert "conf.cfg" in r.get("warning", "")
+
+    def test_probe_path_list_is_capped(self, proj):
+        d = proj / "proj"
+        for i in range(8):
+            (d / f"cap{i}.txt").write_text("capped_case_token = 1\n")
+        r = json.loads(search_tool("CAPPED_CASE_TOKEN", path=str(d), task_id="t-zm"))
+        w = r.get("warning", "")
+        assert "case-insensitive" in w
+        assert "+3 more" in w  # 8 files, 5 shown
 
     def test_matching_search_unaffected(self, proj):
         r = json.loads(search_tool("TOKEN_ALPHA", path=str(proj / "proj"), task_id="t-zm"))

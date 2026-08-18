@@ -417,7 +417,18 @@ class TurnFileMutationVerifier:
         ident = self._identity_for_path(raw_path, task_id)
         if ident is None or ident.backend_kind != "local":
             return None
-        if not _path_allowed_for_observation(ident.path):
+        resolved = _resolve_local_path(raw_path, task_id)
+        if resolved is None:
+            return None
+        # Classify the absolute task-relative target, not the model's raw path.
+        # A harmless-looking relative name can resolve under ~/.aws or Hermes
+        # application state when the task cwd points there.
+        if not _path_allowed_for_observation(str(resolved)):
+            return None
+        # Inspect ancestors before touching the leaf.  O_NOFOLLOW only protects
+        # the final component, so without this walk an intermediate symlink or
+        # Windows reparse point could redirect the verifier into protected data.
+        if _path_has_link_or_reparse_ancestor(resolved):
             return None
         with self._lock:
             if self._budget.generation != expected_generation:
@@ -426,14 +437,13 @@ class TurnFileMutationVerifier:
                 self._budget.overflow = True
                 return None
             self._budget.snapshot_attempts += 1
-        resolved = _resolve_local_path(raw_path, task_id)
-        if resolved is None:
-            return None
         try:
-            resolved.lstat()
+            target_stat = os.lstat(resolved)
         except FileNotFoundError:
             return _MISSING_CONTENT_FINGERPRINT
         except OSError:
+            return None
+        if _stat_is_link_or_reparse(target_stat):
             return None
         fp, read_bytes = _stable_local_fingerprint(
             resolved,
@@ -455,12 +465,9 @@ def _canonical_observation_key(raw_path: str, task_id: str) -> Optional[str]:
     resolved = _resolve_local_path(raw_path, task_id)
     if resolved is None:
         return None
-    try:
-        from agent.tool_dispatch_helpers import _canonical_path
-
-        return str(_canonical_path(str(resolved)))
-    except Exception:
-        return str(resolved.resolve())
+    # Observation rejects link traversal, so lexical normalization is the
+    # correct alias key and avoids dereferencing a path before policy checks.
+    return os.path.normcase(os.path.normpath(str(resolved)))
 
 
 def _default_resolve_backend(task_id: str) -> Tuple[str, str, str]:
@@ -509,15 +516,15 @@ def _path_dialect() -> str:
 
 def _resolve_local_path(raw_path: str, task_id: str) -> Optional[Path]:
     try:
-        from tools.file_tools import _resolve_path_for_task
+        from tools.file_tools import _resolve_local_path_for_task_lexically
 
-        resolved = _resolve_path_for_task(raw_path, task_id or "default")
+        resolved = _resolve_local_path_for_task_lexically(
+            raw_path,
+            task_id or "default",
+        )
     except Exception:
-        try:
-            resolved = Path(raw_path).expanduser()
-        except Exception:
-            return None
-    if not isinstance(resolved, Path):
+        return None
+    if not isinstance(resolved, Path) or not resolved.is_absolute():
         return None
     return resolved
 
@@ -544,12 +551,15 @@ def _path_allowed_for_observation(path: str) -> bool:
     if ".." in parts:
         return False
     try:
-        from agent.file_safety import get_read_block_error, is_write_denied
+        from agent.file_safety import get_file_verifier_block_error
 
-        if get_read_block_error(p) or is_write_denied(p):
+        if get_file_verifier_block_error(p):
             return False
     except Exception:
-        pass
+        # Observation is a privileged read of the mutation target.  If the
+        # lexical privacy classifier cannot be loaded or executed, fail closed
+        # before lstat/open instead of probing a potentially secret path.
+        return False
     return True
 
 
@@ -562,6 +572,39 @@ def _is_dos_device_component(name: str) -> bool:
         *{f"COM{i}" for i in range(1, 10)},
         *{f"LPT{i}" for i in range(1, 10)},
     }
+
+
+def _stat_is_link_or_reparse(value: os.stat_result) -> bool:
+    """Return whether an lstat result can redirect path traversal."""
+    if stat.S_ISLNK(value.st_mode):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(value, "st_file_attributes", 0) & reparse_flag)
+
+
+def _path_has_link_or_reparse_ancestor(path: Path) -> bool:
+    """Fail closed if any existing component before *path* redirects I/O.
+
+    The leaf is deliberately excluded: callers run this check before the first
+    target lstat, then validate the leaf's lstat result separately.  A missing
+    ancestor means the leaf cannot exist yet and is safe to classify as a
+    missing target; every other inspection error is treated as unsafe.
+    """
+    try:
+        if not path.is_absolute():
+            return True
+        for ancestor in reversed(path.parents):
+            try:
+                value = os.lstat(ancestor)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return True
+            if _stat_is_link_or_reparse(value):
+                return True
+        return False
+    except Exception:
+        return True
 
 
 def _stable_local_fingerprint(
@@ -670,10 +713,10 @@ def _stable_local_fingerprint_inprocess(
     if time.monotonic() > deadline:
         return None, 0
     try:
-        st = path.lstat()
+        st = os.lstat(path)
     except OSError:
         return None, 0
-    if stat.S_ISLNK(st.st_mode):
+    if _stat_is_link_or_reparse(st):
         return None, 0
     if not stat.S_ISREG(st.st_mode):
         return None, 0

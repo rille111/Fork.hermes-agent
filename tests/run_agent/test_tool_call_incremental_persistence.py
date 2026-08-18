@@ -241,6 +241,156 @@ def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
     assert result["failed"] is True
     assert result["completed"] is False
     assert result["turn_exit_reason"] == "session_persistence_failed"
+    # No exception was visible (flush returned False), so the cause is
+    # unknown — but the machine-readable contract fields must still be set.
+    assert result["failure_reason"] == "session_persistence_failed:unknown"
+    assert isinstance(result.get("error"), str) and result["error"].strip() != ""
+
+
+def test_pre_execution_flush_failure_finalizer_persists_paired_not_started_rows(
+    tmp_path,
+):
+    """The finalizer retry must never durably land dangling tool calls."""
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = "pre-execution-flush-recovery"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    tool_calls = [
+        _mock_tool_call(arguments='{"q": "one"}', call_id="must-not-run-1"),
+        _mock_tool_call(arguments='{"q": "two"}', call_id="must-not-run-2"),
+    ]
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=tool_calls,
+    )
+    agent._execute_tool_calls = MagicMock()
+
+    real_flush = agent._flush_messages_to_session_db
+    failed_tool_turn_flush = False
+
+    def _fail_pre_execution_flush_once(messages, conversation_history=None):
+        nonlocal failed_tool_turn_flush
+        tail = messages[-1] if messages else None
+        if (
+            not failed_tool_turn_flush
+            and isinstance(tail, dict)
+            and tail.get("role") == "assistant"
+            and tail.get("tool_calls")
+        ):
+            failed_tool_turn_flush = True
+            return False
+        return real_flush(messages, conversation_history)
+
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=_fail_pre_execution_flush_once
+    )
+
+    try:
+        result = agent.run_conversation("inspect the repository")
+        durable = _durable_messages(db_path, session_id)
+    finally:
+        db.close()
+
+    assert failed_tool_turn_flush is True
+    agent._execute_tool_calls.assert_not_called()
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert [message["role"] for message in durable] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+    ]
+    assert [
+        tool_call["id"] for tool_call in durable[1]["tool_calls"]
+    ] == ["must-not-run-1", "must-not-run-2"]
+    assert [message["tool_call_id"] for message in durable[2:]] == [
+        "must-not-run-1",
+        "must-not-run-2",
+    ]
+    assert all("not started" in message["content"] for message in durable[2:])
+    assert all(
+        message["effect_disposition"] == "none" for message in durable[2:]
+    )
+
+
+def test_locked_flush_exception_surfaces_locked_cause_in_result_contract():
+    """SQLite write-lock contention must surface as a 'locked' cause.
+
+    Gateway contract: result['failure_reason'] is exactly
+    'session_persistence_failed:locked' and result['error'] is a non-empty
+    string whose wording talks about busy storage, NOT disk space.
+    """
+    import sqlite3
+
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="must-not-run")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=sqlite3.OperationalError("database is locked")
+    )
+    agent.interim_assistant_callback = MagicMock()
+    agent._execute_tool_calls = MagicMock()
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("inspect the repository")
+
+    agent.interim_assistant_callback.assert_not_called()
+    agent._execute_tool_calls.assert_not_called()
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert result["failure_reason"] == "session_persistence_failed:locked"
+    assert isinstance(result.get("error"), str) and result["error"].strip() != ""
+    assert "busy" in result["error"].lower()
+    assert "disk" not in result["error"].lower()
+
+
+def test_persistence_cause_resets_between_turns():
+    """A locked failure on turn 1 must not leak its cause into turn 2."""
+    import sqlite3
+
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="must-not-run")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=sqlite3.OperationalError("database is locked")
+    )
+    agent._execute_tool_calls = MagicMock()
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        first = agent.run_conversation("inspect the repository")
+        assert first["failure_reason"] == "session_persistence_failed:locked"
+
+        # Storage recovered but the flush function now reports a bare False
+        # (no exception): the stale 'locked' cause must not be reused.
+        agent.client.chat.completions.create.side_effect = None
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="I'll inspect the repository now.",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(call_id="must-not-run-2")],
+        )
+        agent._flush_messages_to_session_db = MagicMock(return_value=False)
+        second = agent.run_conversation("inspect the repository again")
+
+    assert second["turn_exit_reason"] == "session_persistence_failed"
+    assert second["failure_reason"] == "session_persistence_failed:unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +566,12 @@ def test_tool_result_is_durable_before_ui_completion_on_abnormal_exit(
 @pytest.mark.parametrize("executor_mode", ["sequential", "concurrent"])
 def test_failed_tool_result_persist_blocks_completion_projection(executor_mode):
     agent = _make_agent()
-    tool_call = _mock_tool_call(call_id="failed-persist")
-    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    tool_calls = [
+        _mock_tool_call(call_id="failed-persist-1"),
+        _mock_tool_call(call_id="failed-persist-2"),
+        _mock_tool_call(call_id="failed-persist-3"),
+    ]
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
     messages: list = []
     agent._flush_messages_to_session_db = MagicMock(return_value=False)
     agent.tool_complete_callback = MagicMock()
@@ -428,7 +582,7 @@ def test_failed_tool_result_persist_blocks_completion_projection(executor_mode):
     )
 
     with (
-        dispatch_patch,
+        dispatch_patch as dispatch,
         patch(
             "agent.tool_executor.maybe_persist_tool_result",
             side_effect=lambda **kwargs: kwargs["content"],
@@ -449,13 +603,65 @@ def test_failed_tool_result_persist_blocks_completion_projection(executor_mode):
 
     agent.tool_complete_callback.assert_not_called()
     assert getattr(agent, "_incremental_persistence_failed", False) is True
+    assert agent._flush_messages_to_session_db.call_count == 1
+    assert [message["tool_call_id"] for message in messages] == [
+        "failed-persist-1",
+        "failed-persist-2",
+        "failed-persist-3",
+    ]
+
+    if executor_mode == "sequential":
+        # Calls after the failed durable write were never dispatched. They
+        # still need matching, explicitly side-effect-free tool rows so the
+        # turn finalizer can retry a provider-valid transcript.
+        dispatch.assert_called_once()
+        assert messages[0]["content"] == "repository result"
+        assert all(
+            "not started" in message["content"]
+            and message["effect_disposition"] == "none"
+            for message in messages[1:]
+        )
+    else:
+        # A parallel batch has already dispatched every call before result
+        # persistence begins. Preserve those real results instead of falsely
+        # labelling them side-effect-free or not started.
+        assert dispatch.call_count == 3
+        assert all("repository result" in message["content"] for message in messages)
+        assert all("not started" not in message["content"] for message in messages)
+        assert all(message.get("effect_disposition") != "none" for message in messages)
 
 
-def test_segmented_batch_stops_before_later_segment_after_persist_failure():
+def test_invalid_args_persist_failure_pairs_later_calls_without_dispatch():
+    agent = _make_agent()
+    invalid = _mock_tool_call(arguments="{", call_id="invalid")
+    later = _mock_tool_call(call_id="later")
+    assistant_message = SimpleNamespace(content="", tool_calls=[invalid, later])
+    messages: list = []
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+
+    with patch("run_agent.handle_function_call") as dispatch:
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "task-1",
+        )
+
+    dispatch.assert_not_called()
+    assert [message["tool_call_id"] for message in messages] == ["invalid", "later"]
+    assert "invalid" in messages[0]["content"].lower()
+    assert "not started" in messages[1]["content"]
+    assert messages[1]["effect_disposition"] == "none"
+
+
+def test_segmented_batch_pairs_later_segments_after_persist_failure():
     agent = _make_agent()
     first = _mock_tool_call(call_id="first")
+    parallel_peer = _mock_tool_call(call_id="parallel-peer")
     second = _mock_tool_call(call_id="second")
-    assistant_message = SimpleNamespace(tool_calls=[first, second])
+    third = _mock_tool_call(call_id="third")
+    assistant_message = SimpleNamespace(
+        tool_calls=[first, parallel_peer, second, third]
+    )
     messages: list = []
     agent._flush_messages_to_session_db = MagicMock(return_value=False)
 
@@ -472,12 +678,31 @@ def test_segmented_batch_stops_before_later_segment_after_persist_failure():
             assistant_message,
             messages,
             "task-1",
-            segments=[("parallel", [first]), ("sequential", [second])],
+            segments=[
+                ("parallel", [first, parallel_peer]),
+                ("sequential", [second]),
+                ("parallel", [third]),
+            ],
         )
 
-    invoke.assert_called_once()
+    assert invoke.call_count == 2
     dispatch.assert_not_called()
     assert getattr(agent, "_incremental_persistence_failed", False) is True
+    assert [message["tool_call_id"] for message in messages] == [
+        "first",
+        "parallel-peer",
+        "second",
+        "third",
+    ]
+    assert all("first result" in message["content"] for message in messages[:2])
+    assert all(
+        message.get("effect_disposition") != "none" for message in messages[:2]
+    )
+    assert all(
+        "not started" in message["content"]
+        and message["effect_disposition"] == "none"
+        for message in messages[2:]
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 
+import pytest
 
 from hermes_cli.logs import (
     LOG_FILES,
@@ -13,6 +14,7 @@ from hermes_cli.logs import (
     _parse_since,
     _read_last_n_lines,
     _read_tail,
+    normalize_log_level,
 )
 
 
@@ -46,6 +48,23 @@ class TestParseLineTimestamp:
 class TestExtractLevel:
     def test_info(self):
         assert _extract_level("2026-01-01 00:00:00 INFO gateway.run: msg") == "INFO"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("all", None),
+        ("diag", "DEBUG"),
+        ("WARN", "WARNING"),
+        ("fatal", "CRITICAL"),
+        ("crit", "CRITICAL"),
+        (" error ", "ERROR"),
+    ],
+)
+def test_normalize_log_level_aliases(value, expected):
+    assert normalize_log_level(value) == expected
 
 
 # ---------------------------------------------------------------------------

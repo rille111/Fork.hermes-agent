@@ -235,3 +235,61 @@ class TestFlushCursorMarkerPop:
                 assert "the final answer" in _contents(db)
             finally:
                 db.close()
+
+    def test_finalizer_footer_repersists_through_real_identity_flush(self):
+        """The verifier footer survives the finalizer's two real DB flushes.
+
+        ``finalize_turn`` first persists the response, then adds the verifier
+        footer and persists again.  The second flush must revisit the mutated
+        assistant dict after its marker is popped instead of identity-skipping
+        the previous scan prefix.
+        """
+        from agent.turn_finalizer import finalize_turn
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                agent = _make_agent(db)
+                agent.context_compressor = None
+                agent._turn_failed_file_mutations = {
+                    "default:config.yaml": {
+                        "tool": "patch",
+                        "error_preview": "failed",
+                        "disk_snapshot": None,
+                        "_task_id": "default",
+                        "_display_path": "config.yaml",
+                    }
+                }
+                agent._file_mutation_verifier_enabled = lambda: True
+                agent._format_file_mutation_failure_footer = (
+                    lambda _failed: "MOCKED FOOTER"
+                )
+                agent._turn_completion_explainer_enabled = lambda: False
+
+                messages = [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+                result = finalize_turn(
+                    agent=agent,
+                    final_response="answer",
+                    api_call_count=1,
+                    interrupted=False,
+                    failed=False,
+                    messages=messages,
+                    conversation_history=[],
+                    effective_task_id="default",
+                    turn_id="test",
+                    user_message="q",
+                    original_user_message="q",
+                    _should_review_memory=False,
+                    _turn_exit_reason="text_response(stop)",
+                )
+
+                assert result["final_response"].endswith("MOCKED FOOTER")
+                assert messages[-1]["content"].endswith("MOCKED FOOTER")
+                # Assert the durable /resume source, not an in-memory snapshot.
+                assert _contents(db)[-1] == "answer\n\nMOCKED FOOTER"
+            finally:
+                db.close()
