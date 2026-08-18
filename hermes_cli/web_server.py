@@ -11416,7 +11416,7 @@ async def get_logs(
     component: Optional[str] = None,
     search: Optional[str] = None,
 ):
-    from hermes_cli.logs import _read_tail, LOG_FILES
+    from hermes_cli.logs import LOG_FILES, _read_tail, normalize_log_level
 
     log_name = LOG_FILES.get(file)
     if not log_name:
@@ -11432,8 +11432,9 @@ async def get_logs(
 
     # Normalize "ALL" / "all" / empty → no filter. _matches_filters treats an
     # empty tuple as "must match a prefix" (startswith(()) is always False),
-    # so passing () instead of None silently drops every line.
-    min_level = level if level and level.upper() != "ALL" else None
+    # so passing () instead of None silently drops every line. Aliases:
+    # DIAG→DEBUG, WARN→WARNING, FATAL→CRITICAL.
+    min_level = normalize_log_level(level)
     if component and component.lower() != "all":
         comp_prefixes = COMPONENT_PREFIXES.get(component)
         if comp_prefixes is None:

@@ -59,6 +59,24 @@ _LOGGER_NAME_RE = re.compile(
 # Level ordering for >= filtering
 _LEVEL_ORDER = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
 
+# Friendly aliases accepted by CLI/API filters (normalized before lookup).
+_LEVEL_ALIASES = {
+    "DIAG": "DEBUG",
+    "WARN": "WARNING",
+    "FATAL": "CRITICAL",
+    "CRIT": "CRITICAL",
+}
+
+
+def normalize_log_level(level: Optional[str]) -> Optional[str]:
+    """Map user-facing level names onto canonical Python logging names."""
+    if not level:
+        return None
+    name = level.strip().upper()
+    if not name or name == "ALL":
+        return None
+    return _LEVEL_ALIASES.get(name, name)
+
 
 def _parse_since(since_str: str) -> Optional[datetime]:
     """Parse a relative time string like '1h', '30m', '2d' into a datetime cutoff.
@@ -190,9 +208,9 @@ def tail_log(
             print(f"Invalid --since value: {since!r}. Use format like '1h', '30m', '2d'.")
             sys.exit(1)
 
-    min_level = level.upper() if level else None
+    min_level = normalize_log_level(level)
     if min_level and min_level not in _LEVEL_ORDER:
-        print(f"Invalid --level: {level!r}. Use DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
+        print(f"Invalid --level: {level!r}. Use DEBUG, INFO, WARNING, ERROR, CRITICAL (aliases: DIAG, WARN, FATAL).")
         sys.exit(1)
 
     # Resolve component to logger name prefixes
