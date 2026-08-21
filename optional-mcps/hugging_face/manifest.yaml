@@ -14,7 +14,7 @@ source: https://huggingface.co/docs/hub/agents-mcp
 # Underscored name so UIs render "Hugging Face", not "Huggingface".
 transport:
   type: http
-  url: https://huggingface.co/mcp
+  url: https://huggingface.co/mcp?login
 
 auth:
   type: oauth
