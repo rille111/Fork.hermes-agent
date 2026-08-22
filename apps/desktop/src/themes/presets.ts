@@ -666,7 +666,7 @@ export const emberTheme: DesktopTheme = {
 /** Chandra's storm command deck — cool pixel sky with ember actions. */
 export const chandraTheme: DesktopTheme = {
   name: 'chandra',
-  label: 'Chandra',
+  label: 'Stormforge',
   description: 'Pixel storm command deck with ember controls',
   colors: {
     background: '#070B18',
