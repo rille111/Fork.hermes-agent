@@ -98,11 +98,11 @@ def _make_agent(tmp_path: Path) -> AIAgent:
     return agent
 
 
-def _tool_call(call_id: str, name: str = "web_extract", arguments: str = "{}"):
+def _tool_call(call_id: str):
     return SimpleNamespace(
         id=call_id,
         type="function",
-        function=SimpleNamespace(name=name, arguments=arguments),
+        function=SimpleNamespace(name="web_extract", arguments="{}"),
     )
 
 
@@ -213,6 +213,140 @@ def test_sequential_tool_timeout_suppresses_late_terminal_event(tmp_path, monkey
         ("hung", "tool_timeout"),
         ("next", None),
     ]
+
+
+def test_sequential_tool_interrupt_hides_lifecycle_cancel_detail(tmp_path, monkeypatch):
+    from agent.subagent_lifecycle import (
+        SubagentLaunchRequest,
+        SubagentLifecycleService,
+        SubagentState,
+    )
+
+    agent = _make_agent(tmp_path)
+    agent._subagent_id = "sa-lifecycle-cancel-output"
+    agent._delegate_role = "leaf"
+    agent._delegate_depth = 1
+    first_started = threading.Event()
+    release_first = threading.Event()
+    terminal_events: list[dict] = []
+
+    def _dispatch(*_args, **_kwargs):
+        first_started.set()
+        release_first.wait()
+        return "late result"
+
+    messages: list[dict] = []
+
+    def _run_child(*_args, **_kwargs):
+        execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(tool_calls=[_tool_call("hung")]),
+            messages,
+            "task",
+        )
+        return {
+            "status": "interrupted",
+            "summary": None,
+            "api_calls": 0,
+            "duration_seconds": 0,
+        }
+
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "30")
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools",
+        lambda **_kwargs: agent,
+    )
+    monkeypatch.setattr("tools.delegate_tool._run_child_lifecycle", _run_child)
+    lifecycle = SubagentLifecycleService(
+        lambda: SimpleNamespace(
+            session_id="parent-lifecycle-cancel-output",
+            enabled_toolsets=["file"],
+        )
+    )
+
+    try:
+        with (
+            patch("run_agent.handle_function_call", side_effect=_dispatch),
+            patch(
+                "agent.tool_executor._emit_terminal_post_tool_call",
+                side_effect=lambda *_args, **kwargs: terminal_events.append(kwargs),
+            ),
+        ):
+            handle = lifecycle.launch(SubagentLaunchRequest(goal="cancel output test"))
+            assert first_started.wait(timeout=5)
+            assert lifecycle.cancel(
+                handle,
+                reason="PRIVATE_LIFECYCLE_REASON_DO_NOT_COPY",
+            ).accepted
+            assert lifecycle.wait(handle, timeout_seconds=5).state is SubagentState.CANCELLED
+    finally:
+        release_first.set()
+
+    assert "subagent cancellation requested" in messages[0]["content"]
+    assert "PRIVATE_LIFECYCLE_REASON_DO_NOT_COPY" not in messages[0]["content"]
+    assert "user interrupt" not in messages[0]["content"]
+    assert "PRIVATE_LIFECYCLE_REASON_DO_NOT_COPY" not in terminal_events[0]["error_message"]
+    assert terminal_events[0]["error_type"] == "tool_interrupted"
+
+
+@pytest.mark.parametrize(
+    "clarify_timeout",
+    [resolve_clarify_timeout({}), 0],
+    ids=["default-3600s", "unlimited"],
+)
+def test_sequential_timeout_does_not_cut_clarify_human_wait(
+    tmp_path, monkeypatch, clarify_timeout
+):
+    """Clarify waits on a human; the generic sequential deadline must not fire.
+
+    Default ``agent.clarify_timeout`` is 3600s; ``<= 0`` is unlimited. Both
+    outlast ``HERMES_CONCURRENT_TOOL_TIMEOUT_S`` (default 420s).
+    """
+    agent = _make_agent(tmp_path)
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "1.0")
+    monkeypatch.setattr(
+        "tools.clarify_gateway.get_clarify_timeout",
+        lambda: clarify_timeout,
+    )
+
+    def _callback(question, choices, multi_select=False):
+        # Must OUTLAST the 1.0s sequential deadline — the test proves the
+        # generic timeout never cuts a human clarify wait.
+        time.sleep(1.3)
+        return "A"
+
+    agent.clarify_callback = _callback
+    terminal_events: list[dict] = []
+
+    def _dispatch(_name, _args, _task_id, *, tool_call_id, **_kwargs):
+        return "second result"
+
+    def _capture_terminal_event(*_args, **kwargs):
+        terminal_events.append(kwargs)
+
+    messages: list[dict] = []
+    started = time.monotonic()
+    with (
+        patch("run_agent.handle_function_call", side_effect=_dispatch),
+        patch(
+            "agent.tool_executor._emit_terminal_post_tool_call",
+            side_effect=_capture_terminal_event,
+        ),
+    ):
+        execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(tool_calls=[_clarify_call(), _tool_call("next")]),
+            messages,
+            "task",
+        )
+
+    assert time.monotonic() - started < 10.0
+    assert [message["tool_call_id"] for message in messages] == ["clarify-1", "next"]
+    payload = json.loads(messages[0]["content"])
+    assert payload["user_response"] == "A"
+    assert "timed out" not in messages[0]["content"]
+    assert messages[1]["content"] == "second result"
+    assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
 
 
 def test_timed_out_mutation_fences_later_mutations_until_worker_finishes(
@@ -353,63 +487,3 @@ def test_timed_out_mutation_fences_later_mutations_until_worker_finishes(
 
     assert dispatched == ["hung-write", "resumed-write"]
     assert resumed_messages[0]["content"] == "later mutation result"
-
-
-@pytest.mark.parametrize(
-    "clarify_timeout",
-    [resolve_clarify_timeout({}), 0],
-    ids=["default-3600s", "unlimited"],
-)
-def test_sequential_timeout_does_not_cut_clarify_human_wait(
-    tmp_path, monkeypatch, clarify_timeout
-):
-    """Clarify waits on a human; the generic sequential deadline must not fire.
-
-    Default ``agent.clarify_timeout`` is 3600s; ``<= 0`` is unlimited. Both
-    outlast ``HERMES_CONCURRENT_TOOL_TIMEOUT_S`` (default 420s).
-    """
-    agent = _make_agent(tmp_path)
-    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "1.0")
-    monkeypatch.setattr(
-        "tools.clarify_gateway.get_clarify_timeout",
-        lambda: clarify_timeout,
-    )
-
-    def _callback(question, choices, multi_select=False):
-        # Must OUTLAST the 1.0s sequential deadline — the test proves the
-        # generic timeout never cuts a human clarify wait.
-        time.sleep(1.3)
-        return "A"
-
-    agent.clarify_callback = _callback
-    terminal_events: list[dict] = []
-
-    def _dispatch(_name, _args, _task_id, *, tool_call_id, **_kwargs):
-        return "second result"
-
-    def _capture_terminal_event(*_args, **kwargs):
-        terminal_events.append(kwargs)
-
-    messages: list[dict] = []
-    started = time.monotonic()
-    with (
-        patch("run_agent.handle_function_call", side_effect=_dispatch),
-        patch(
-            "agent.tool_executor._emit_terminal_post_tool_call",
-            side_effect=_capture_terminal_event,
-        ),
-    ):
-        execute_tool_calls_sequential(
-            agent,
-            SimpleNamespace(tool_calls=[_clarify_call(), _tool_call("next")]),
-            messages,
-            "task",
-        )
-
-    assert time.monotonic() - started < 10.0
-    assert [message["tool_call_id"] for message in messages] == ["clarify-1", "next"]
-    payload = json.loads(messages[0]["content"])
-    assert payload["user_response"] == "A"
-    assert "timed out" not in messages[0]["content"]
-    assert messages[1]["content"] == "second result"
-    assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
