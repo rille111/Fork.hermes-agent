@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import {
   liveSessionProjectId,
+  markSessionMoved,
   NO_PROJECT_ID,
   type SidebarProjectTree
 } from '@/app/chat/sidebar/projects/workspace-groups'
@@ -606,6 +607,12 @@ export async function moveSessionToProject(
   })
 
   const moved = res.cwd || cwd
+
+  // Float the row to the top of its new project so the drop is visible. Keyed
+  // by the row's OWN id: `sessionId` is a stored key, which is not always the
+  // `id` that `sessionRecency` later sees.
+  markSessionMoved($sessions.get().find(s => sessionMatchesStoredId(s, sessionId))?.id || sessionId)
+
   setSessions(prev =>
     prev.map(s =>
       sessionMatchesStoredId(s, sessionId)

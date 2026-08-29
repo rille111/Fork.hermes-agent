@@ -132,7 +132,12 @@ const workspaceDragPayload = (): SessionDragPayload | null => {
 
   const stored = $sessions.get().find(s => sessionMatchesStoredId(s, selected))
 
-  return { id: selected, profile: stored?.profile ?? '', title: stored ? storedSessionTitle(stored) : '' }
+  return {
+    cwd: stored?.cwd,
+    id: selected,
+    profile: stored?.profile ?? '',
+    title: stored ? storedSessionTitle(stored) : ''
+  }
 }
 
 // The main tab drags like a session tile — drop it on a composer to link the

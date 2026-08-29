@@ -370,13 +370,9 @@ function SidebarSessionRowImpl({
         )}
         data-glass-opaque={dragging ? '' : undefined}
         data-working={liveTurn ? 'true' : undefined}
-        // The row runs BOTH drags off one press, and each declines outside its
-        // own region — so no timing/arbitration rule is needed and neither can
-        // steal the other's gesture. Over the sidebar only the reorder has a
-        // target (the session drop denies: side chrome hosts no main tile);
-        // over the tree only the session drop does (no sortable row there).
-        // Whichever one the release lands on is the one that commits.
-        {...dragHandleProps}
+        // The row body owns session drag (project move / stack / link). The
+        // dedicated grabber alone carries dnd-kit's reorder listeners, so one
+        // release can never commit both a workspace move and a list reorder.
         onPointerDown={event => {
           // The grabber already carries these same listeners, and the ⋯
           // cluster keeps its own gestures.
@@ -388,8 +384,10 @@ function SidebarSessionRowImpl({
           // no macOS snap-back, Esc aborts instantly). Sub-threshold releases
           // stay ordinary clicks, so resume / pin / open-in-window are
           // untouched.
-          startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
-          dragHandleProps?.onPointerDown?.(event)
+          startSessionDrag(
+            { cwd: session.cwd, id: session.id, profile: session.profile || 'default', title },
+            event
+          )
         }}
         // Hovering a row from another profile (the all-profiles view) telegraphs
         // a cross-profile resume — start that backend's spawn now so the click

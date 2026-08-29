@@ -401,7 +401,7 @@ function tileDragPayload(storedSessionId: string): SessionDragPayload {
   const stored = tileStoredRow(storedSessionId)
   const title = stored ? sessionTitle(stored) : draftTitleFor(storedSessionId) || NEW_SESSION_TITLE
 
-  return { id: storedSessionId, profile: stored?.profile ?? '', title }
+  return { cwd: stored?.cwd, id: storedSessionId, profile: stored?.profile ?? '', title }
 }
 
 // ---------------------------------------------------------------------------

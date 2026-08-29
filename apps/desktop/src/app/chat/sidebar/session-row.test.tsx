@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { startSessionDrag } from '@/app/chat/session-drag'
 import type { SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
@@ -224,6 +225,40 @@ describe('SidebarSessionRow running arc', () => {
 })
 
 describe('SidebarSessionRow', () => {
+  it('uses the row body for session drag and only the grab handle for reorder', () => {
+    const onReorderPointerDown = vi.fn()
+    const session = makeSession({ cwd: 'C:/proj/Temporary', title: 'Separate drag gestures' })
+
+    render(
+      <SidebarSessionRow
+        dragHandleProps={{ onPointerDown: onReorderPointerDown }}
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={noop}
+        onToggleUnread={noop}
+        reorderable
+        session={session}
+        unread={false}
+      />
+    )
+
+    fireEvent.pointerDown(screen.getByText('Separate drag gestures'))
+
+    expect(startSessionDrag).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: 'C:/proj/Temporary', id: 's1' }),
+      expect.anything()
+    )
+    expect(onReorderPointerDown).not.toHaveBeenCalled()
+
+    fireEvent.pointerDown(screen.getByLabelText('Reorder Separate drag gestures'))
+
+    expect(onReorderPointerDown).toHaveBeenCalledTimes(1)
+    expect(startSessionDrag).toHaveBeenCalledTimes(1)
+  })
+
   it('keeps an aria-label on the kebab without wrapping it in a Tip', () => {
     render(
       <SidebarSessionRow

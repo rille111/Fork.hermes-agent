@@ -163,8 +163,33 @@ export function isBranchTargetLane(group: SidebarSessionGroup, gitKind: SidebarR
   )
 }
 
-/** A session's recency stamp (last activity, falling back to creation). */
-export const sessionRecency = (session: SessionInfo): number => session.last_active || session.started_at || 0
+// Rows the user just re-homed into a project. A drop is a deliberate act on
+// that session, so it counts as activity: the row surfaces at the TOP of its
+// new project instead of sinking to wherever its last message left it — the
+// whole point of the gesture is seeing where it landed.
+//
+// This lives client-side on purpose. `session.workspace.move` replaces cwd +
+// git identity but deliberately does NOT touch `last_active`, so an optimistic
+// cache bump alone would be undone by the next authoritative `session.list`
+// and the row would sink seconds after the drop.
+const movedSessionAt = new Map<string, number>()
+
+/** Count a re-home as activity for `sessionId` (unix seconds, like the API). */
+export function markSessionMoved(sessionId: string, at: number = Date.now() / 1000): void {
+  if (sessionId) {
+    movedSessionAt.set(sessionId, at)
+  }
+}
+
+/** Drop every remembered move — test seam. */
+export function clearMovedSessions(): void {
+  movedSessionAt.clear()
+}
+
+/** A session's recency stamp: last activity, a just-completed move, or
+ *  creation — whichever is newest. */
+export const sessionRecency = (session: SessionInfo): number =>
+  Math.max(movedSessionAt.get(session.id) ?? 0, session.last_active || session.started_at || 0)
 
 /** Default-branch names that pin to the top and read as the repo's trunk. */
 const TRUNK_BRANCHES = new Set(['main', 'master', 'trunk', 'develop'])

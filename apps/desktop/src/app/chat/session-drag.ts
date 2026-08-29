@@ -10,7 +10,9 @@
  *     that edge (the zone sheet morphs to the half);
  *   - a chat zone's CENTER / the composer → link: insert an `@session` chip
  *     into that surface's composer (ChatDropOverlay owns the visual);
- *   - anything else (sidebar, terminal, gutters) → deny.
+ *   - a sidebar PROJECT row (`data-sessions-project`) → re-home the session
+ *     via `session.workspace.move` (same as the row's "Move to project" menu);
+ *   - anything else (sidebar empty space, terminal, gutters) → deny.
  *
  * Zones that don't host a chat surface are NOT targets — the overlay never
  * lights them, so a release there must not commit either (one truth).
@@ -49,6 +51,9 @@ import {
   SESSION_TILE_DRAG
 } from '@/components/pane-shell/tree/store'
 import type { EngineZone, ZoneRect } from '@/components/pane-shell/tree/zones-engine'
+import { translateNow } from '@/i18n'
+import { notify, notifyError } from '@/store/notifications'
+import { $projectTree, moveSessionToProject, projectIdForCwd, projectRootCwd } from '@/store/projects'
 import { openSessionTile, type TileDock } from '@/store/session-states'
 
 import { requestComposerInsertRefs } from './composer/focus'
@@ -80,6 +85,133 @@ function snapshotSurfaces(): SurfaceSnapshot[] {
   }))
 }
 
+interface ProjectDropTarget {
+  el: HTMLElement
+  id: string
+  label: string
+  rect: ZoneRect
+}
+
+/** Folder-bearing project rows currently on screen. Home has no folder, so it
+ *  is never a drop target — same rule as the session menu's Move-to-project
+ *  submenu. */
+function snapshotProjectDrops(excludedProjectId: null | string): ProjectDropTarget[] {
+  const tree = $projectTree.get()
+
+  return [...document.querySelectorAll<HTMLElement>('[data-sessions-project]')].flatMap(el => {
+    const id = el.dataset.sessionsProject?.trim() || ''
+    const project = tree.find(node => node.id === id)
+
+    if (!id || id === excludedProjectId || !project || project.isNoProject || !projectRootCwd(project)) {
+      return []
+    }
+
+    return [{ el, id, label: project.label, rect: snapRect(el) }]
+  })
+}
+
+function setProjectDropHot(el: HTMLElement | null, hot: HTMLElement | null): HTMLElement | null {
+  if (hot === el) {
+    return hot
+  }
+
+  if (hot) {
+    hot.style.background = ''
+    hot.style.outline = ''
+  }
+
+  if (el) {
+    el.style.background = 'var(--ui-row-active-background)'
+    el.style.outline = '1px solid var(--ui-accent)'
+  }
+
+  return el
+}
+
+const RAIL_PAD = 8
+const RAIL_ITEM_H = 32
+
+function folderProjects(excludedProjectId: null | string) {
+  return $projectTree
+    .get()
+    .filter(project => project.id !== excludedProjectId && !project.isNoProject && projectRootCwd(project))
+}
+
+function createProjectDropRail(
+  projects: ReturnType<typeof folderProjects>,
+  sidebar: ZoneRect
+): { destroy: () => void; targets: ProjectDropTarget[] } {
+  const root = document.createElement('div')
+  const width = Math.max(0, sidebar.right - sidebar.left)
+
+  root.dataset.sessionProjectRail = ''
+  root.style.cssText =
+    `position:fixed;left:${sidebar.left}px;top:${sidebar.top}px;width:${width}px;` +
+    'z-index:9998;pointer-events:none;padding:8px;box-sizing:border-box;' +
+    'background:var(--ui-sidebar-surface-background,var(--dt-card));' +
+    'color:var(--ui-text-primary);font-size:0.75rem;'
+
+  const heading = document.createElement('div')
+
+  heading.textContent = translateNow('sidebar.projects.moveToProject')
+  heading.style.cssText =
+    'position:absolute;left:8px;top:-18px;color:var(--ui-text-tertiary);font-weight:500;white-space:nowrap'
+  root.appendChild(heading)
+
+  const targets = projects.map((project, index) => {
+    const el = document.createElement('div')
+    const top = sidebar.top + RAIL_PAD + index * RAIL_ITEM_H
+    const bottom = top + RAIL_ITEM_H
+
+    el.textContent = project.label
+    el.style.cssText = `height:${RAIL_ITEM_H}px;display:flex;align-items:center;padding:0 8px;`
+    root.appendChild(el)
+
+    return {
+      el,
+      id: project.id,
+      label: project.label,
+      rect: { bottom, left: sidebar.left + RAIL_PAD, right: sidebar.right - RAIL_PAD, top }
+    }
+  })
+
+  document.body.appendChild(root)
+
+  return { destroy: () => root.remove(), targets }
+}
+
+function resolveProjectDropTargets(
+  sidebar: ZoneRect | null,
+  excludedProjectId: null | string
+): { destroy: () => void; targets: ProjectDropTarget[] } {
+  const visible = snapshotProjectDrops(excludedProjectId)
+  const folders = folderProjects(excludedProjectId)
+
+  if (visible.length >= 2 || !sidebar) {
+    return { destroy: () => undefined, targets: visible }
+  }
+
+  const others = folders.filter(project => project.id !== visible[0]?.id)
+
+  if (!others.length) {
+    return { destroy: () => undefined, targets: visible }
+  }
+
+  return createProjectDropRail(others, sidebar)
+}
+
+function sessionsZoneRect(zones: EngineZone[]): ZoneRect | null {
+  const tree = $layoutTree.get()
+
+  if (!tree) {
+    return null
+  }
+
+  return zones.find(zone => findGroup(tree, zone.id)?.panes.includes('sessions'))?.rect ?? null
+}
+
+const PROJECT_DROP_HINT: DropHint = { kind: 'group' }
+
 /** A session may land in any zone hosting a MAIN tile — another chat stack, a
  *  Browser tile, a page — never the sidebar/terminal zones. Returns the pane a
  *  stack anchors to, plus whether the zone hosts a CHAT surface (only those
@@ -105,16 +237,21 @@ export function startSessionDrag(
   e: ReactPointerEvent<HTMLElement>,
   opts?: { double?: DoubleTapContext; onTap?: () => void }
 ) {
+  const sourceProjectId = payload.cwd?.trim() ? projectIdForCwd(payload.cwd) : null
   let zones: EngineZone[] = []
   let strips: StripSnapshot[] = []
   let surfaces: SurfaceSnapshot[] = []
   let composers: ZoneRect[] = []
   let zoneHost = new Map<string, ReturnType<typeof tileZoneHost>>()
+  let projects: ProjectDropTarget[] = []
+  let hotProject: HTMLElement | null = null
+  let destroyProjectRail: () => void = () => undefined
 
   // Commit intent, updated per resolved move (the machinery flushes the final
   // move before commit, so these always match the released-at position).
   let split: { anchor: string; before?: null | string; pos: TileDock } | null = null
   let link: null | string = null
+  let move: ProjectDropTarget | null = null
 
   // The drag SOURCE (sidebar row or tile tab). Captured synchronously — React
   // clears `currentTarget` after the pointerdown handler returns, but this runs
@@ -134,6 +271,10 @@ export function startSessionDrag(
       surfaces = snapshotSurfaces()
       composers = queryAllVisible('[data-slot="composer-root"]').map(snapRect)
       zoneHost = new Map(zones.map(zone => [zone.id, tileZoneHost(zone.id)]))
+      const resolved = resolveProjectDropTargets(sessionsZoneRect(zones), sourceProjectId)
+
+      projects = resolved.targets
+      destroyProjectRail = resolved.destroy
       source?.style.setProperty('opacity', '0.45')
       // The same sentinel the zone overlay + chat surfaces key off — the
       // whole drop language (sheets, pills, caret, link overlay) lights up.
@@ -141,12 +282,30 @@ export function startSessionDrag(
     },
 
     onEnd() {
+      hotProject = setProjectDropHot(null, hotProject)
+      destroyProjectRail()
+      destroyProjectRail = () => undefined
+
       if (source) {
         source.style.opacity = restoreOpacity
       }
     },
 
     resolveMove(x, y): DropHint | null {
+      const project = projects.find(target => rectContains(target.rect, x, y)) ?? null
+
+      if (project) {
+        split = null
+        link = null
+        move = project
+        hotProject = setProjectDropHot(project.el, hotProject)
+
+        return PROJECT_DROP_HINT
+      }
+
+      hotProject = setProjectDropHot(null, hotProject)
+      move = null
+
       const zone = zones.find(z => rectContains(z.rect, x, y))
       const host = zone ? zoneHost.get(zone.id) : null
 
@@ -192,7 +351,19 @@ export function startSessionDrag(
     },
 
     onCommit() {
-      if (split) {
+      if (move) {
+        const target = move
+
+        void moveSessionToProject(payload.id, target.id, payload.profile)
+          .then(() =>
+            notify({
+              durationMs: 2_000,
+              kind: 'success',
+              message: translateNow('sidebar.projects.movedTo', target.label)
+            })
+          )
+          .catch(err => notifyError(err, translateNow('sidebar.projects.moveFailed')))
+      } else if (split) {
         openSessionTile(payload.id, split.pos, split.anchor, split.before)
         // A tile for this session may already exist (openSessionTile is
         // idempotent — e.g. persisted from an earlier run): a drop must never
