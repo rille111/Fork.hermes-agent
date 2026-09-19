@@ -31,7 +31,7 @@ from agent.auxiliary_client import (
     _call_fallback_candidate_async,
     call_llm,
     async_call_llm,
-    _is_unsupported_temperature_error,
+    _is_unsupported_parameter_error,
 )
 
 
@@ -53,7 +53,7 @@ class TestIsUnsupportedTemperatureError:
         "unrecognized request argument supplied: temperature",
     ])
     def test_matches_real_provider_messages(self, message):
-        assert _is_unsupported_temperature_error(RuntimeError(message)) is True
+        assert _is_unsupported_parameter_error(RuntimeError(message), "temperature") is True
 
     @pytest.mark.parametrize("message", [
         # Unrelated 400s must NOT trigger a silent-retry
@@ -65,7 +65,7 @@ class TestIsUnsupportedTemperatureError:
         "temperature must be between 0 and 2",
     ])
     def test_does_not_match_unrelated_errors(self, message):
-        assert _is_unsupported_temperature_error(RuntimeError(message)) is False
+        assert _is_unsupported_parameter_error(RuntimeError(message), "temperature") is False
 
 
 def _dummy_response():
