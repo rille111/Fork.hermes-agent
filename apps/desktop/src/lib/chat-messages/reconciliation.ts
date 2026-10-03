@@ -21,6 +21,7 @@ export function comparableUserMessageText(text: string): string {
     .trim()
 }
 
+
 const validTimelineBoundary = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value > 0
 
@@ -58,6 +59,65 @@ const assistantTimelineMatch = (stored: ChatMessage, local: ChatMessage) => {
   const storedText = normalizedTimelineText(stored)
 
   return Boolean(storedText) && storedText === normalizedTimelineText(local)
+}
+
+const userTurnMatch = (stored: ChatMessage, local: ChatMessage) =>
+  stored.role === 'user' &&
+  local.role === 'user' &&
+  normalizedTimelineText(stored) === normalizedTimelineText(local) &&
+  (stored.attachmentRefs ?? []).join('\n') === (local.attachmentRefs ?? []).join('\n')
+
+/**
+ * Find the hydrated assistant representing a local failed tail turn.
+ *
+ * Text and provider tool-call ids are not globally unique, so the match is
+ * deliberately anchored to the last visible user turn on both timelines.
+ */
+const tailTurnAssistantMatchIndex = (
+  storedMessages: ChatMessage[],
+  localMessages: ChatMessage[],
+  localAssistantIndex: number
+) => {
+  if (
+    localMessages
+      .slice(localAssistantIndex + 1)
+      .some(message => (message.role === 'user' || message.role === 'assistant') && !message.hidden)
+  ) {
+    return -1
+  }
+
+  const visibleUser = (message: ChatMessage) => message.role === 'user' && !message.hidden
+  const visibleAssistant = (message: ChatMessage) => message.role === 'assistant' && !message.hidden
+  const localUserIndex = localMessages.findLastIndex(visibleUser)
+  const storedUserIndex = storedMessages.findLastIndex(visibleUser)
+
+  if (
+    localUserIndex < 0 ||
+    storedUserIndex < 0 ||
+    localMessages.filter(visibleUser).length !== storedMessages.filter(visibleUser).length ||
+    !userTurnMatch(storedMessages[storedUserIndex], localMessages[localUserIndex])
+  ) {
+    return -1
+  }
+
+  const localAssistants = localMessages.slice(localUserIndex + 1).filter(visibleAssistant)
+  const storedAssistants = storedMessages.slice(storedUserIndex + 1).filter(visibleAssistant)
+
+  // A hidden directive can produce another assistant under the same visible
+  // user. Match the whole segment sequence, never an earlier equivalent reply.
+  if (
+    localAssistants.length !== storedAssistants.length ||
+    !storedAssistants.every((stored, index) => {
+      const local = localAssistants[index]
+      const sameRow = stored.rowId === undefined || local.rowId === undefined || stored.rowId === local.rowId
+
+      return sameRow && assistantTimelineMatch(stored, local)
+    })
+  ) {
+    return -1
+  }
+
+  return storedMessages.findLastIndex(visibleAssistant)
 }
 
 const timelinePartMatch = (stored: ChatMessagePart, local: ChatMessagePart) => {
@@ -138,6 +198,12 @@ function reconcileLocalAssistantTimeline(nextMessages: ChatMessage[], currentMes
   })
 }
 
+interface PreservedRun {
+  after?: string
+  before?: string
+  rows: ChatMessage[]
+}
+
 export function preserveLocalAssistantErrors(
   nextMessages: ChatMessage[],
   currentMessages: ChatMessage[]
@@ -159,91 +225,129 @@ export function preserveLocalAssistantErrors(
     return {
       ...message,
       error: local.error,
+      ...(local.errorSurface ? { errorSurface: local.errorSurface } : {}),
       pending: false
     }
   })
 
   const existingIds = new Set(mergedNextMessages.map(message => message.id))
-  const normalize = (value: string) => comparableUserMessageText(value).replace(/\s+/g, ' ')
 
-  const currentUsers = currentMessages
-    .map((message, index) => ({ index, message }))
-    .filter(({ message }) => message.role === 'user' && !message.hidden)
+  // Renderer ids are positional, so a hydrated page can carry a local row under
+  // a new id; its durable rowId still names the same row (#119326).
+  const hydratedIdByRowId = new Map(
+    mergedNextMessages.flatMap(message => (message.rowId === undefined ? [] : [[message.rowId, message.id] as const]))
+  )
 
-  const authoritativeUsers = mergedNextMessages.filter(message => message.role === 'user' && !message.hidden)
+  const hydratedIdFor = (message: ChatMessage): string | undefined =>
+    existingIds.has(message.id)
+      ? message.id
+      : message.rowId === undefined
+        ? undefined
+        : hydratedIdByRowId.get(message.rowId)
 
-  const errorsToPreserve: Array<{
-    matchedUserId?: string
-    message: ChatMessage
-    precedingUser: ChatMessage | null
-    userFromTail: number
-  }> = []
+  const preserveIds = new Set<string>()
+  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim()
+  const tailUserInNext = [...mergedNextMessages].reverse().find(message => message.role === 'user' && !message.hidden)
+  const tailUserText = tailUserInNext ? normalize(chatMessageText(tailUserInNext)) : ''
+  const tailUserRefs = tailUserInNext ? (tailUserInNext.attachmentRefs ?? []).join('\n') : ''
+
+  const matchesTailUserInNext = (candidate: ChatMessage) =>
+    Boolean(tailUserInNext) &&
+    normalize(chatMessageText(candidate)) === tailUserText &&
+    (candidate.attachmentRefs ?? []).join('\n') === tailUserRefs
 
   for (let index = 0; index < currentMessages.length; index += 1) {
     const message = currentMessages[index]
 
-    if (message.role === 'assistant' && message.error && !message.hidden && !existingIds.has(message.id)) {
-      const precedingUserOrdinal = currentUsers.findLastIndex(user => user.index < index)
-      const precedingUser = precedingUserOrdinal >= 0 ? currentUsers[precedingUserOrdinal].message : null
-
-      errorsToPreserve.push({
-        message: { ...message, pending: false },
-        precedingUser,
-        userFromTail: precedingUserOrdinal >= 0 ? currentUsers.length - precedingUserOrdinal - 1 : -1
-      })
-    }
-  }
-
-  if (errorsToPreserve.length === 0) {
-    return mergedNextMessages
-  }
-
-  // Align from the transcript tail, not by the first matching text. A repeated
-  // prompt must not move the newest local error underneath an older equal turn.
-  for (const localError of errorsToPreserve) {
-    if (!localError.precedingUser || localError.userFromTail < 0) {
+    if (message.role !== 'assistant' || !message.error || message.hidden || existingIds.has(message.id)) {
       continue
     }
 
-    const candidate = authoritativeUsers.at(-(localError.userFromTail + 1))
+    const hydratedId = hydratedIdFor(message)
 
-    if (
-      candidate &&
-      normalize(chatMessageText(candidate)) === normalize(chatMessageText(localError.precedingUser)) &&
-      (candidate.attachmentRefs ?? []).join('\n') === (localError.precedingUser.attachmentRefs ?? []).join('\n')
-    ) {
-      localError.matchedUserId = candidate.id
+    const hydratedAssistantIndex =
+      hydratedId === undefined
+        ? tailTurnAssistantMatchIndex(mergedNextMessages, currentMessages, index)
+        : mergedNextMessages.findIndex(candidate => candidate.id === hydratedId && candidate.role === 'assistant')
+
+    if (hydratedAssistantIndex !== -1) {
+      mergedNextMessages[hydratedAssistantIndex] = {
+        ...mergedNextMessages[hydratedAssistantIndex],
+        error: message.error,
+        ...(message.errorSurface ? { errorSurface: message.errorSurface } : {}),
+        pending: false
+      }
+
+      continue
+    }
+
+    preserveIds.add(message.id)
+
+    for (let probe = index - 1; probe >= 0; probe -= 1) {
+      const candidate = currentMessages[probe]
+
+      if (candidate.hidden) {
+        continue
+      }
+
+      if (candidate.role === 'user' && hydratedIdFor(candidate) === undefined && !matchesTailUserInNext(candidate)) {
+        preserveIds.add(candidate.id)
+      }
+
+      break
     }
   }
 
-  const result: ChatMessage[] = []
-  const consumedErrors = new Set<string>()
+  if (preserveIds.size === 0) {
+    return mergedNextMessages
+  }
 
-  for (const message of mergedNextMessages) {
-    result.push(message)
+  // Put each run of kept rows back after the refreshed row that preceded it
+  // locally instead of below newer turns. When the refresh already fills that
+  // gap with the same role/text sequence, the turn was stored under new ids.
+  // A run with no refreshed successor stays trailing. #118002
+  const label = (message: ChatMessage) => `${message.role}:${normalize(chatMessageText(message))}`
+  const runs: PreservedRun[] = []
+  let anchor: string | undefined
 
-    if (message.role === 'user' && !message.hidden) {
-      for (const localError of errorsToPreserve) {
-        if (!consumedErrors.has(localError.message.id) && localError.matchedUserId === message.id) {
-          result.push(localError.message)
-          consumedErrors.add(localError.message.id)
-        }
+  for (const message of currentMessages) {
+    const open = runs.at(-1)?.after === anchor ? runs.at(-1) : undefined
+    const hydratedId = preserveIds.has(message.id) ? undefined : hydratedIdFor(message)
+
+    if (hydratedId !== undefined) {
+      if (open) {
+        open.before = hydratedId
+      }
+
+      anchor = hydratedId
+    } else if (preserveIds.has(message.id)) {
+      const kept = { ...message, pending: false }
+
+      if (open) {
+        open.rows.push(kept)
+      } else {
+        runs.push({ after: anchor, rows: [kept] })
       }
     }
   }
 
-  for (const localError of errorsToPreserve) {
-    if (!consumedErrors.has(localError.message.id)) {
-      if (localError.precedingUser && !existingIds.has(localError.precedingUser.id)) {
-        result.push(localError.precedingUser)
-        existingIds.add(localError.precedingUser.id)
-      }
+  const indexOf = (id?: string) => mergedNextMessages.findIndex(message => message.id === id)
+  const keptAfter = new Map<string | undefined, ChatMessage[]>()
 
-      result.push(localError.message)
+  for (const { after, before, rows } of runs) {
+    const gap = before === undefined ? [] : mergedNextMessages.slice(indexOf(after) + 1, indexOf(before))
+
+    if (gap.length && gap.map(label).join('\n') === rows.map(label).join('\n')) {
+      continue
     }
+
+    keptAfter.set(after, [...(keptAfter.get(after) ?? []), ...rows])
   }
 
-  return result
+  return [
+    ...mergedNextMessages.flatMap(message => [message, ...(keptAfter.get(message.id) ?? [])]),
+    ...(keptAfter.get(undefined) ?? [])
+  ]
 }
 
 export function branchGroupForUser(userMessage: ChatMessage): string {

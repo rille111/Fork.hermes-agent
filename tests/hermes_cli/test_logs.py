@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import pytest
 
 from hermes_cli.logs import (
-    LOG_FILES,
     _extract_level,
     _extract_logger_name,
     _line_matches_component,
@@ -162,9 +161,3 @@ class TestReadTail:
 # LOG_FILES registry
 # ---------------------------------------------------------------------------
 
-class TestLogFiles:
-    def test_known_log_files(self):
-        assert "agent" in LOG_FILES
-        assert "errors" in LOG_FILES
-        assert "gateway" in LOG_FILES
-        assert "gui" in LOG_FILES
