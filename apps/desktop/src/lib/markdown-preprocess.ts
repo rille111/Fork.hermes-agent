@@ -307,7 +307,8 @@ function bareUrlEnd(url: string): number {
 
 function linkBareUrls(text: string): string {
   return text.replace(RAW_URL_RE, (match: string, index: number) => {
-    if (text[index - 1] === '<') {
+    // `](` = the target of a link whose label was split off by an inline code span.
+    if (text[index - 1] === '<' || text.slice(Math.max(0, index - 2), index) === '](') {
       return match
     }
 

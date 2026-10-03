@@ -89,13 +89,14 @@ const _MEDIA_EXT_ALTERNATION = [...MEDIA_DELIVERY_EXTS].sort((a, b) => b.length 
  */
 const _MEDIA_PATH_ANCHORED = `(?:~/|/|[A-Za-z]:[/\\\\])\\S+?(?:[^\\S\\n]+\\S+?)*?\\.(?:${_MEDIA_EXT_ALTERNATION})(?=[\\s\`"'*_,;:)\\]}]|MEDIA:|$)`
 
-const MEDIA_LINE_RE = new RegExp(
-  `(^|\\n)[\\t ]*[\`"']?MEDIA:\\s*(?<line>\`[^\`\\n]+\`|"[^"\\n]+"|'[^'\\n]+'|${_MEDIA_PATH_ANCHORED}|\\S+)[\`"']?[\\t ]*(\\n|$)`,
-  'g'
-)
+// Fork (titan): a standalone MEDIA line owns its whole line, so an unquoted path with
+// spaces resolves whatever its extension, UNC and CRLF included, and a blank `MEDIA:`
+// never consumes the following line. Inline tags use upstream's anchored form below.
+const MEDIA_LINE_RE =
+  /(^|\n)[\t ]*[`"']?MEDIA:[\t ]*(?<line>`[^`\r\n]+`|"[^"\r\n]+"|'[^'\r\n]+'|[^\r\n]*?\S)[`"']?[\t ]*(?=\r?\n|$)/g
 
 const MEDIA_TAG_RE = new RegExp(
-  `[\`"']?MEDIA:\\s*(?<inline>\`[^\`\\n]+\`|"[^"\\n]+"|'[^'\\n]+'|${_MEDIA_PATH_ANCHORED}|\\S+)[\`"']?`,
+  `[\`"']?MEDIA:[\\t ]*(?<inline>\`[^\`\\n]+\`|"[^"\\n]+"|'[^'\\n]+'|${_MEDIA_PATH_ANCHORED}|\\S+)[\`"']?`,
   'g'
 )
 

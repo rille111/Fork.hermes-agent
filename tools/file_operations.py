@@ -370,6 +370,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         from tools.environments.local import _bash_safe_path
         return "'" + _bash_safe_path(arg).replace("'", "'\"'\"'") + "'"
 
+    def _escape_shell_pattern(self, arg: str) -> str:
+        """Single-quote a search PATTERN verbatim. Unlike ``_escape_shell_arg`` it never
+        path-translates: a pattern that looks like a Windows path (``C:\\Users\\x``) is
+        text to match, not a path to visit, so it must reach rg/grep unchanged (fork, titan)."""
+        return "'" + arg.replace("'", "'\"'\"'") + "'"
+
     def _escape_native_tool_arg(self, arg: str) -> str:
         """Quote a path for a NATIVE Windows binary (rg, node, git ...): those don't
         understand the MSYS ``/c/...`` form and Hermes disables MSYS argument

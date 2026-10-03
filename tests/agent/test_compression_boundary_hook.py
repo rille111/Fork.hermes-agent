@@ -40,7 +40,7 @@ class TestCompressionBoundaryHook:
     def test_on_session_start_called_with_compression_boundary(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
 
@@ -99,7 +99,7 @@ class TestCompressionBoundaryHook:
         from hermes_state import SessionDB
 
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
@@ -138,7 +138,7 @@ class TestCompressionBoundaryHook:
     def test_failure_before_persistence_does_not_notify(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
@@ -158,7 +158,7 @@ class TestCompressionBoundaryHook:
     def test_no_progress_does_not_notify(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
             compressor = MagicMock()
@@ -218,7 +218,7 @@ class TestCompressionBoundaryHook:
         """If the context engine raises from on_session_start, compression still completes."""
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(db)
 
@@ -288,7 +288,7 @@ class TestSessionCompressEvent:
         from hermes_state import SessionDB
 
         events = []
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db = SessionDB(db_path=Path(tmpdir) / "test.db")
             agent = self._make_agent(
                 db, event_callback=lambda et, ctx: events.append((et, ctx))

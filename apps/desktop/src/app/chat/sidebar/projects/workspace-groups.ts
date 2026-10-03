@@ -35,17 +35,11 @@ export interface SidebarSessionGroup {
   profile?: string
 }
 
-export type SidebarRepoGitKind = 'directory' | 'git'
-
 /** A repo node: holds its branch/worktree lanes (`repo -> lane -> sessions`). */
 export interface SidebarWorkspaceTree {
   id: string
   label: string
   path: null | string
-  // Backend-owned capability. Optional only for compatibility with runtimes
-  // predating this discriminator; each folder in a multi-folder project may
-  // differ, so this belongs on the repo node rather than the project.
-  gitKind?: SidebarRepoGitKind
   groups: SidebarSessionGroup[]
   sessionCount: number
 }
@@ -142,32 +136,6 @@ export const isDetachedSession = (session: SessionInfo): boolean =>
 /** The one definition of a main-checkout lane id (must match the backend tree). */
 export const branchLaneId = (repoRoot: string, branch?: string): string =>
   `${repoRoot}::branch::${(branch ?? '').trim()}`
-
-/** Whether clicking a lane targets a branch in the repo's main checkout. */
-export function isBranchTargetLane(group: SidebarSessionGroup, gitKind: SidebarRepoGitKind | undefined): boolean {
-  if (!group.isMain || group.isKanban) {
-    return false
-  }
-
-  if (gitKind === 'directory') {
-    return false
-  }
-
-  // Both current and legacy backends must supply the canonical branch-lane
-  // identity rooted at this lane's path. A repo can contain mixed historical
-  // evidence, so repo-level Git capability alone cannot promote a path-backed
-  // `isMain` fallback lane into a branch target.
-  const marker = '::branch::'
-  const markerAt = group.id.lastIndexOf(marker)
-  const branch = markerAt > 0 ? group.id.slice(markerAt + marker.length).trim() : ''
-
-  return Boolean(
-    group.path &&
-    markerAt > 0 &&
-    pathKey(group.id.slice(0, markerAt)) === pathKey(group.path) &&
-    branch === group.label.trim()
-  )
-}
 
 /** A session's recency stamp (last activity, falling back to creation). */
 export const sessionRecency = (session: SessionInfo): number => session.last_active || session.started_at || 0
@@ -578,51 +546,17 @@ function livePathForRepo(repoRoot: string, session: SessionInfo): string {
 }
 
 /**
- * The lane a live session belongs to WITHIN a known repo node. Git repos use
- * branch/worktree identities; directory repos use the backend's path-backed
- * fallback. A fresh row may not carry git metadata yet, so the repo capability
- * is the baseline. When `git_repo_root` is present it is stronger, newer
- * evidence when it identifies THIS repo (the directory may have been
- * initialized after the snapshot) and also promotes snapshots from older
- * backends that predate `gitKind`.
- *
- * The session's path comes from `livePathForRepo` (v2026.8.27), so older or
- * imported rows carrying only `git_repo_root` and no cwd still resolve to the
- * main checkout instead of being dropped. Lane ids mirror the backend:
+ * The lane a live session belongs to WITHIN a known repo root, by path. A fresh
+ * row normally uses cwd; older/imported rows can carry only git_repo_root, which
+ * still identifies the main checkout exactly. Mirrors the backend's lane ids:
  * main checkout -> branch lane, `.worktrees/t_<hex>` -> kanban, any other
  * `.worktrees/<slug>` -> that worktree's own lane.
  */
-function liveLaneForRepo(repo: SidebarWorkspaceTree, session: SessionInfo): null | SidebarSessionGroup {
-  const repoRoot = (repo.path || '').trim()
+function liveLaneForRepo(repoRoot: string, session: SessionInfo): null | SidebarSessionGroup {
   const sessionPath = livePathForRepo(repoRoot, session)
 
   if (!sessionPath || !isPathUnder(repoRoot, sessionPath)) {
     return null
-  }
-
-  const sessionGitRoot = (session.git_repo_root || '').trim()
-  const hasMatchingGitRoot = Boolean(sessionGitRoot) && pathKey(sessionGitRoot) === pathKey(repoRoot)
-
-  // A nested repo's session also sits under each parent folder. Its explicit
-  // git root is ownership evidence: do not duplicate it into an enclosing
-  // directory/repo lane, nor use it to promote that parent to Git.
-  if (sessionGitRoot && !hasMatchingGitRoot) {
-    return null
-  }
-
-  const isGit =
-    repo.gitKind === 'git' ||
-    hasMatchingGitRoot ||
-    (repo.gitKind === undefined && repo.groups.some(group => isBranchTargetLane(group, undefined)))
-
-  if (!isGit) {
-    return {
-      id: repoRoot,
-      isMain: true,
-      label: baseName(repoRoot) || repo.label,
-      path: repoRoot,
-      sessions: []
-    }
   }
 
   const wt = sessionPath.match(/^(.*[/\\]\.worktrees)[/\\]([^/\\]+)/)
@@ -656,17 +590,6 @@ export function overlayRepoLanes(
   removed: ReadonlySet<string> = NO_REMOVED
 ): SidebarWorkspaceTree {
   const repoRootKey = pathKey(repo.path)
-
-  const effectiveGitKind = live.some(session => {
-    const sessionGitRoot = (session.git_repo_root || '').trim()
-
-    return !removed.has(session.id) && Boolean(sessionGitRoot) && pathKey(sessionGitRoot) === repoRootKey
-  })
-    ? 'git'
-    : repo.gitKind
-
-  const placementRepo = effectiveGitKind === repo.gitKind ? repo : { ...repo, gitKind: effectiveGitKind }
-
   let changed = false
   // Lanes that arrived with no rows are not eviction casualties — they're real
   // structure (a `git worktree list` lane, or one whose sessions are pinned
@@ -690,18 +613,6 @@ export function overlayRepoLanes(
     const sessionPath = livePathForRepo(repo.path ?? '', session)
 
     if (removed.has(session.id) || !sessionPath) {
-      continue
-    }
-
-    const sessionGitRoot = (session.git_repo_root || '').trim()
-
-    // Explicit git ownership is stronger than path containment. Apply it
-    // before matching existing lanes too: a parent directory may retain a
-    // historical lane whose path is now a nested repo, but that must not make
-    // the parent absorb the nested repo's fresh live session. Linked
-    // worktrees still pass because their git root is the owning repo root even
-    // when their cwd lives elsewhere.
-    if (sessionGitRoot && pathKey(sessionGitRoot) !== repoRootKey) {
       continue
     }
 
@@ -733,7 +644,7 @@ export function overlayRepoLanes(
     // key a worktree lane off the git-probed root OR a branch-style id), then
     // the main-lane label; create it when the snapshot lacked it.
     if (!lane) {
-      const placed = repo.path ? liveLaneForRepo(placementRepo, session) : null
+      const placed = repo.path ? liveLaneForRepo(repo.path, session) : null
 
       if (!placed) {
         continue
@@ -787,14 +698,14 @@ export function overlayRepoLanes(
   }
 
   if (!changed) {
-    return effectiveGitKind === repo.gitKind ? repo : { ...repo, gitKind: effectiveGitKind }
+    return repo
   }
 
   // Drop lanes emptied by eviction (the server only emits non-empty lanes; the
   // git-worktree enhancer re-adds any still-real worktree as an empty lane).
   const groups = sortWorktreeGroups(lanes.filter(g => g.sessions.length > 0 || emptyOnInput.has(g.id)))
 
-  return { ...repo, gitKind: effectiveGitKind, groups, sessionCount: groups.reduce((n, g) => n + g.sessions.length, 0) }
+  return { ...repo, groups, sessionCount: groups.reduce((n, g) => n + g.sessions.length, 0) }
 }
 
 /**

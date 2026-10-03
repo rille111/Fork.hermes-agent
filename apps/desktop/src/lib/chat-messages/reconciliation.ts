@@ -246,7 +246,9 @@ export function preserveLocalAssistantErrors(
         : hydratedIdByRowId.get(message.rowId)
 
   const preserveIds = new Set<string>()
-  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim()
+  // Fork: compare the visible prompt only, so a turn persisted with image/screenshot
+  // placeholders or an attached-context tail still matches its optimistic local copy.
+  const normalize = (value: string) => comparableUserMessageText(value).replace(/\s+/g, ' ')
   const tailUserInNext = [...mergedNextMessages].reverse().find(message => message.role === 'user' && !message.hidden)
   const tailUserText = tailUserInNext ? normalize(chatMessageText(tailUserInNext)) : ''
   const tailUserRefs = tailUserInNext ? (tailUserInNext.attachmentRefs ?? []).join('\n') : ''

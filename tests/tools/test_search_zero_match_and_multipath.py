@@ -27,25 +27,19 @@ class TestZeroMatchProbe:
 
         ops = _get_file_ops(task_id="t-zm-raw-pattern")
         pattern = r"C:\Users\ADMIN\literal.txt"
-        commands = []
+        calls = []
 
-        monkeypatch.setattr(ops, "_has_command", lambda command: command == "rg")
+        monkeypatch.setattr(ops, "_resolve_command", lambda command: "rg" if command == "rg" else None)
 
-        def path_escape_must_not_receive_pattern(arg):
-            raise AssertionError(f"search pattern was treated as a path: {arg!r}")
-
-        monkeypatch.setattr(ops, "_escape_shell_arg", path_escape_must_not_receive_pattern)
-
-        def capture(command, *, timeout):
-            commands.append((command, timeout))
+        def capture(words, fetch_limit, timeout, **_kwargs):
+            calls.append(words)
             return SimpleNamespace(stdout="", exit_code=1)
 
-        monkeypatch.setattr(ops, "_exec", capture)
+        monkeypatch.setattr(ops, "_run_rg_bounded", capture)
 
         assert ops._zero_match_probe(pattern, str(proj / "proj"), None) is None
-        assert len(commands) == 3
-        assert all(f"'{pattern}'" in command for command, _timeout in commands)
-
+        assert len(calls) == len(ops._ZERO_MATCH_PROBES)
+        assert all(f"'{pattern}'" in words for words in calls)
 
     def test_case_mismatch_hint_names_the_files(self, proj):
         # The probe already ran the -i search; it must hand over the paths,

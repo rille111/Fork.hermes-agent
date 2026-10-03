@@ -301,7 +301,7 @@ class TestAsyncCallLlmUnsupportedTemperatureRetry:
         ):
             result = await _call_fallback_candidate_async(
                 client,
-                "gpt-5.6-sol",
+                "custom-vision-model",
                 "main-agent(openai-api)",
                 task="vision",
                 messages=[{"role": "user", "content": "describe image"}],
