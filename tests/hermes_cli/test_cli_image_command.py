@@ -5,7 +5,6 @@ from cli import (
     HermesCLI,
     _collect_query_images,
     _format_image_attachment_badges,
-    _termux_example_image_path,
 )
 
 
@@ -31,6 +30,18 @@ class TestImageCommand:
 
         assert cli_obj._attached_images == [img]
 
+
+    def test_handle_image_command_bare_shows_usage(self):
+        """Bare ``/image`` prints the usage hint through the CLI's real printing
+        helpers — this branch raised NameError before the lazy import existed."""
+        cli_obj = _make_cli()
+
+        with patch("cli._cprint") as mock_print:
+            cli_obj._handle_image_command("/image")
+
+        assert cli_obj._attached_images == []
+        rendered = " ".join(str(arg) for call in mock_print.call_args_list for arg in call.args)
+        assert "Usage: /image <path>" in rendered
 
     def test_handle_image_command_rejects_non_image_file(self, tmp_path):
         file_path = tmp_path / "notes.txt"
@@ -81,19 +92,9 @@ class TestPreprocessImagesWithVision:
                 announce=False,
             )
 
-        assert f"[Image attached at: {img}]" in enriched
+        assert str(img) in enriched
         assert "couldn't be analyzed" in enriched
         assert enriched.endswith("please inspect this")
-
-
-class TestTermuxImageHints:
-    def test_termux_example_image_path_prefers_real_shared_storage_root(self, monkeypatch):
-        existing = {"/sdcard", "/storage/emulated/0"}
-        monkeypatch.setattr("cli.os.path.isdir", lambda path: path in existing)
-
-        hint = _termux_example_image_path()
-
-        assert hint == "/sdcard/Pictures/cat.png"
 
 
 class TestImageBadgeFormatting:

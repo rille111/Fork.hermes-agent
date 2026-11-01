@@ -39,7 +39,12 @@ class TestZeroMatchProbe:
 
         assert ops._zero_match_probe(pattern, str(proj / "proj"), None) is None
         assert len(calls) == len(ops._ZERO_MATCH_PROBES)
-        assert all(f"'{pattern}'" in words for words in calls)
+        # Backslashes may be doubled for the local Windows argv transport
+        # (test_shell_arg_transport proves the bytes arrive intact); the pattern
+        # must never be MSYS path-translated.
+        quoted = ops._escape_shell_arg(pattern, translate_path=False)
+        assert "/c/" not in quoted
+        assert all(quoted in words for words in calls)
 
     def test_case_mismatch_hint_names_the_files(self, proj):
         # The probe already ran the -i search; it must hand over the paths,
@@ -316,7 +321,7 @@ class TestSymlinkedRootOnTheFilesLane:
 
     def test_a_symlinked_root_pointing_at_home_is_still_refused(self, tmp_path, monkeypatch):
         """The no-rg breadth guard must classify the link's target (#116270)."""
-        import tools.file_operations as file_operations
+        from tools import file_operations
         from tools.environments.local import LocalEnvironment
         from tools.file_operations import ShellFileOperations
 
