@@ -766,7 +766,9 @@ function normalizeVisibleProse(text: string, sourceListIds: Set<string>): string
 
         const phoneStart = part.start + part.markerLength
         const phoneEnd = part.end - part.markerLength
-        const target = phoneLinkTarget(text.slice(phoneStart, phoneEnd))
+        // Fork (titan): a one- or two-backtick span holding a number becomes a tel link;
+        // three or more backticks stay verbatim code.
+        const target = part.markerLength <= 2 && phoneLinkTarget(text.slice(phoneStart, phoneEnd))
 
         return target && hasPhoneNumberContext(text, phoneStart, phoneEnd) ? `[${part.text}](${target})` : part.text
       }
