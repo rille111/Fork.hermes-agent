@@ -15,7 +15,8 @@
 
 import type { ChildProcess, SpawnOptions } from 'node:child_process'
 
-import { isExternalUrlAllowed } from './external-url-policy'
+import { externalUrlTarget } from '../../shared/src/external-url'
+
 import { absolutizeProtocolRelativeUrl, looksLikeLocalFilesystemPath } from './local-filesystem-path'
 
 export type ExternalOpenResult =
@@ -109,17 +110,15 @@ export async function openExternalUrl(rawUrl: string, deps: ExternalOpenDeps): P
     return { ok: true }
   }
 
-  let parsed: URL
+  const target = externalUrlTarget(raw)
 
-  try {
-    parsed = new URL(raw)
-  } catch {
+  if (!target) {
     return { ok: false, reason: 'invalid' }
   }
 
-  if (parsed.protocol === 'file:') {
+  if (target.kind === 'file') {
     try {
-      await deps.openFile(raw)
+      await deps.openFile(target.url)
     } catch {
       // main's openFile handles its own fallback; never surfaced here
     }
@@ -127,12 +126,7 @@ export async function openExternalUrl(rawUrl: string, deps: ExternalOpenDeps): P
     return { ok: true }
   }
 
-  // Fork (titan): http/https/mailto plus tel: for a strictly well-formed number only.
-  if (!isExternalUrlAllowed(parsed)) {
-    return { ok: false, reason: 'invalid' }
-  }
-
-  const url = parsed.toString()
+  const { url } = target
 
   if (deps.isWsl) {
     return openViaWsl(url, deps)
